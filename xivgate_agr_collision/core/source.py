@@ -461,14 +461,27 @@ def _filter_components(vertices, faces, min_feature, skip_thin, thin_threshold):
     return (*_remove_degenerate_and_duplicate_faces(vertices, selected_faces), skipped)
 
 
-def collect_source(context, settings):
-    objects = selected_source_objects(context)
+def collect_objects(context, settings, objects, name=None):
+    """Collect an explicit source set without depending on viewport selection."""
+    unique = []
+    seen = set()
+    for ob in objects:
+        if (
+                ob is None
+                or ob.type != "MESH"
+                or naming.is_any_collider(ob)
+                or ob.as_pointer() in seen):
+            continue
+        seen.add(ob.as_pointer())
+        unique.append(ob)
+    objects = unique
     if not objects:
         raise ValueError("Select at least one non-collider mesh object")
 
     active = context.view_layer.objects.active
     if active not in objects:
         active = objects[0]
+    source_name = str(name or active.name)
 
     raw_vertices, raw_faces = _collect_evaluated_meshes(context, objects)
     raw_vertices, raw_faces = _remove_degenerate_and_duplicate_faces(
@@ -505,7 +518,7 @@ def collect_source(context, settings):
         raise ValueError("Preprocessing removed all source triangles")
 
     return SourceData(
-        name=active.name,
+        name=source_name,
         object_names=[ob.name for ob in objects],
         raw_vertices=raw_vertices,
         raw_faces=raw_faces,
@@ -515,4 +528,12 @@ def collect_source(context, settings):
         proxy_mode="EXACT_FUSED",
         capped_boundaries=capped_boundaries,
         oriented_closed_shells=oriented_closed_shells,
+    )
+
+
+def collect_source(context, settings):
+    return collect_objects(
+        context,
+        settings,
+        selected_source_objects(context),
     )

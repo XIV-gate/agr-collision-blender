@@ -42,16 +42,21 @@ def _remove_objects(objects):
             bpy.data.meshes.remove(mesh)
 
 
-def _create_collider_collection(context, source_data, result, settings):
+def _create_collider_collection(
+        context, source_data, result, settings, destination_collection=None):
     old_colliders = _generated_colliders(context.scene, source_data.name)
     old_collections = {
         owner
         for ob in old_colliders
         for owner in ob.users_collection
     }
-    temporary_name = "AGR_COLLISION_TMP"
-    collection = bpy.data.collections.new(temporary_name)
-    context.scene.collection.children.link(collection)
+    owns_collection = destination_collection is None
+    if owns_collection:
+        temporary_name = "AGR_COLLISION_TMP"
+        collection = bpy.data.collections.new(temporary_name)
+        context.scene.collection.children.link(collection)
+    else:
+        collection = destination_collection
     created = []
     desired_names = []
 
@@ -82,7 +87,8 @@ def _create_collider_collection(context, source_data, result, settings):
             desired_names.append(name)
     except Exception:
         _remove_objects(created)
-        bpy.data.collections.remove(collection)
+        if owns_collection and bpy.data.collections.get(collection.name) is collection:
+            bpy.data.collections.remove(collection)
         raise
 
     _remove_objects(old_colliders)
@@ -99,8 +105,68 @@ def _create_collider_collection(context, source_data, result, settings):
         ):
             bpy.data.collections.remove(old_collection)
 
-    collection.name = _safe_collection_name(source_data.name)
+    if owns_collection:
+        collection.name = _safe_collection_name(source_data.name)
     return collection, created
+
+
+def generate_for_objects(
+        context, objects, base_name, destination_collection=None,
+        settings=None):
+    """Generate one UCX set for an explicit proxy list.
+
+    This is the stable integration entry point used by AGR Prepare. It avoids
+    mutating viewport selection and lets the caller place UCX beside the
+    prepared render mesh in the same generated collection.
+    """
+    settings = settings or context.scene.xivgate_agr_collision
+    source_data = source.collect_objects(
+        context, settings, objects, name=base_name)
+    result = decompose.decompose(source_data, settings)
+    if not result.complete:
+        raise RuntimeError(result.warnings[-1])
+    if not result.hulls:
+        raise RuntimeError("The decomposition did not produce any hulls")
+
+    budget = validation.agr_triangle_budget(source_data.raw_triangles)
+    if result.total_triangles > budget:
+        raise RuntimeError(
+            "Generated {:,} triangles, exceeding the AGR budget of {:,}".format(
+                result.total_triangles,
+                budget,
+            )
+        )
+
+    collection, colliders = _create_collider_collection(
+        context,
+        source_data,
+        result,
+        settings,
+        destination_collection=destination_collection,
+    )
+    report = validation.validate_colliders(
+        colliders,
+        expected_base=source_data.name,
+        triangle_budget=budget,
+    )
+    if not report.valid:
+        _remove_objects(colliders)
+        raise RuntimeError(report.errors[0])
+
+    settings.last_source = source_data.name
+    settings.last_colliders = len(result.hulls)
+    settings.last_triangles = result.total_triangles
+    settings.last_deviation = result.max_deviation
+    settings.last_input_triangles = source_data.raw_triangles
+    settings.last_proxy_triangles = source_data.proxy_triangles
+    return {
+        "collection": collection,
+        "colliders": colliders,
+        "source": source_data,
+        "decomposition": result,
+        "validation": report,
+        "budget": budget,
+    }
 
 
 class AGR_OT_analyze_selected(bpy.types.Operator):
@@ -162,40 +228,20 @@ class AGR_OT_generate(bpy.types.Operator):
         started = time.perf_counter()
 
         try:
-            source_data = source.collect_source(context, settings)
             settings.last_status = translations.iface(
                 "Searching convex decomposition..."
             )
-            result = decompose.decompose(source_data, settings)
-            if not result.complete:
-                raise RuntimeError(result.warnings[-1])
-            if not result.hulls:
-                raise RuntimeError("The decomposition did not produce any hulls")
-
-            budget = validation.agr_triangle_budget(source_data.raw_triangles)
-            if result.total_triangles > budget:
-                raise RuntimeError(
-                    "Generated {:,} triangles, exceeding the AGR budget of {:,}".format(
-                        result.total_triangles,
-                        budget,
-                    )
-                )
-
-            _, colliders = _create_collider_collection(
+            selected = source.selected_source_objects(context)
+            active = context.view_layer.objects.active
+            base_name = active.name if active in selected else selected[0].name
+            generated = generate_for_objects(
                 context,
-                source_data,
-                result,
-                settings,
+                selected,
+                base_name=base_name,
+                settings=settings,
             )
-            report = validation.validate_colliders(
-                colliders,
-                expected_base=source_data.name,
-                triangle_budget=budget,
-            )
-            if not report.valid:
-                # Keep the geometry visible for diagnosis, but report a failed
-                # validation rather than silently claiming a valid result.
-                result.warnings.extend(report.errors)
+            source_data = generated["source"]
+            result = generated["decomposition"]
 
             if settings.hide_sources:
                 for name in source_data.object_names:
@@ -204,12 +250,6 @@ class AGR_OT_generate(bpy.types.Operator):
                         ob.hide_set(True)
 
             elapsed = time.perf_counter() - started
-            settings.last_source = source_data.name
-            settings.last_colliders = len(result.hulls)
-            settings.last_triangles = result.total_triangles
-            settings.last_deviation = result.max_deviation
-            settings.last_input_triangles = source_data.raw_triangles
-            settings.last_proxy_triangles = source_data.proxy_triangles
             if result.warnings:
                 settings.last_status = translations.iface(
                     "Generated with warnings in {:.2f}s"

@@ -54,7 +54,12 @@ Version 1.1.0 keeps only source selection, quality, generation and validation
 in the primary panel. Geometry preprocessing, convex-search limits and viewport
 display behavior are grouped under a collapsed advanced panel.
 
-Current version: 1.1.0.
+Version 1.2.0 adds a selection-independent integration API for AGR Prepare.
+Prepare can pass an explicit collision proxy, request a UCX set named from the
+prepared High Main, and place the validated hulls directly in that High
+package without changing viewport selection or modifying the proxy.
+
+Current version: 1.2.0.
 
 ## Default AGR settings
 
