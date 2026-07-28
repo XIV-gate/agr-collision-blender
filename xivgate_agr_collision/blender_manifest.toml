@@ -1,0 +1,30 @@
+schema_version = "1.0.0"
+
+id = "xivgate_agr_collision"
+version = "1.0.0"
+name = "AGR Collision"
+tagline = "Generate convex AGR and Unreal UCX collision sets"
+maintainer = "XIVgate"
+type = "add-on"
+
+website = "https://github.com/XIV-gate/xivgate-agr-collision-blender"
+copyright = ["2026 XIVgate"]
+
+tags = ["Object", "Mesh"]
+
+blender_version_min = "5.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[build]
+paths = [
+  "__init__.py",
+  "core",
+  "operators.py",
+  "panel.py",
+  "props.py",
+  "translations.py",
+  "AUTHORS.md",
+  "NOTICE.md",
+  "LICENSE",
+]

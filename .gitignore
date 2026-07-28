@@ -1,0 +1,27 @@
+# Third-party reference binaries are not part of this add-on.
+/UVPackmaster v3.3.3 U2/
+
+# Local review artifacts and generated packages.
+/tmp/
+/build/
+/dist/
+/*.zip
+
+# Python and Blender transient files.
+__pycache__/
+*.py[cod]
+*.blend1
+*.blend2
+
+# Local editor and operating-system files.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+__pycache__/
+*.py[cod]
+*.blend1
+*.blend2
+*.tmp
+.pytest_cache/
+releases/
