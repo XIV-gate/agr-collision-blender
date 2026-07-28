@@ -7,6 +7,13 @@ import bpy
 
 _RU_DEFAULT = {
     "AGR Collision": "Коллайдер AGR",
+    "Collision Quality": "Качество коллизии",
+    "Generate & Validate": "Создание и проверка",
+    "Last Result": "Последний результат",
+    "Advanced Collision Settings": "Расширенные настройки коллизии",
+    "Geometry Preprocessing": "Предварительная обработка геометрии",
+    "Convex Search Limits": "Ограничения поиска выпуклых частей",
+    "Viewport Output": "Отображение результата",
     "Source": "Источник",
     "No active mesh": "Нет активного меш-объекта",
     "Accuracy": "Точность",

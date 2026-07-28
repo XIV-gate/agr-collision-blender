@@ -50,7 +50,11 @@ under **Edit > Preferences > Interface > Translation**.
 Version 1.0.1 keeps English as the source UI and documentation language and
 provides native Russian labels and descriptions for every operator.
 
-Current version: 1.0.1.
+Version 1.1.0 keeps only source selection, quality, generation and validation
+in the primary panel. Geometry preprocessing, convex-search limits and viewport
+display behavior are grouped under a collapsed advanced panel.
+
+Current version: 1.1.0.
 
 ## Default AGR settings
 
