@@ -19,7 +19,11 @@ license = ["SPDX:GPL-3.0-or-later"]
 [build]
 paths = [
   "__init__.py",
-  "core",
+  "core/__init__.py",
+  "core/decompose.py",
+  "core/naming.py",
+  "core/source.py",
+  "core/validation.py",
   "operators.py",
   "panel.py",
   "props.py",
