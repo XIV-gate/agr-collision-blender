@@ -13,6 +13,7 @@ class AGR_PT_collider(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "AGR"
+    bl_order = 20
 
     def draw(self, context):
         layout = self.layout
