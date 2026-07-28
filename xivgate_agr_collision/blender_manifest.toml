@@ -7,7 +7,7 @@ tagline = "Generate convex AGR and Unreal UCX collision sets"
 maintainer = "XIVgate"
 type = "add-on"
 
-website = "https://github.com/XIV-gate/xivgate-agr-collision-blender"
+website = "https://github.com/XIV-gate/agr-collision-blender"
 copyright = ["2026 XIVgate"]
 
 tags = ["Object", "Mesh"]
