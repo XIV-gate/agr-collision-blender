@@ -3,7 +3,7 @@
 Blender 5.2 extension for generating closed, convex, non-overlapping Unreal
 Engine UCX collision sets from selected architectural meshes.
 
-Author and maintainer: **XIVgate**  
+Author and maintainer: **XIVgate**
 License: **GPL-3.0-or-later**
 
 ## Current workflow
@@ -46,6 +46,11 @@ The pipeline does not use voxel remeshing.
 The extension includes English source text and a complete Russian translation.
 Interface labels and tooltips follow Blender's independent translation controls
 under **Edit > Preferences > Interface > Translation**.
+
+Version 1.0.1 keeps English as the source UI and documentation language and
+provides native Russian labels and descriptions for every operator.
+
+Current version: 1.0.1.
 
 ## Default AGR settings
 
