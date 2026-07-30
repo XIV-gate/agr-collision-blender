@@ -38,6 +38,36 @@ assert not proxy.hide_get()
 assert result["validation"].valid
 assert result["decomposition"].total_triangles <= result["budget"]
 
+before_collections = {collection.as_pointer() for collection in bpy.data.collections}
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(5.0, 0.0, 0.0))
+failing_proxy = bpy.context.object
+original_validator = operators.validation.validate_colliders
+try:
+    operators.validation.validate_colliders = (
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("intentional validation failure")))
+    try:
+        operators.generate_for_objects(
+            bpy.context,
+            [failing_proxy],
+            base_name="SM_FailCleanup_Main",
+        )
+    except RuntimeError as exc:
+        assert "intentional validation failure" in str(exc)
+    else:
+        raise AssertionError("Expected intentional validation failure")
+finally:
+    operators.validation.validate_colliders = original_validator
+
+assert {
+    collection.as_pointer()
+    for collection in bpy.data.collections
+} == before_collections
+assert not [
+    obj for obj in bpy.data.objects
+    if obj.name.startswith("UCX_SM_FailCleanup_Main_")
+]
+
 print(
     "AGR_TEST_RESULT",
     {
@@ -46,5 +76,6 @@ print(
         "budget": result["budget"],
         "destination": destination.name,
         "source_unchanged": True,
+        "failed_transaction_clean": True,
     },
 )

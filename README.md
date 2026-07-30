@@ -59,7 +59,11 @@ Prepare can pass an explicit collision proxy, request a UCX set named from the
 prepared High Main, and place the validated hulls directly in that High
 package without changing viewport selection or modifying the proxy.
 
-Current version: 1.2.0.
+Version 1.2.1 guarantees transactional scene cleanup when final collider
+validation raises or fails. AGR Collision remains scene-only: it creates no
+cache, report or output folders; Prepare and Output own all filesystem paths.
+
+Current version: 1.2.1.
 
 ## Default AGR settings
 

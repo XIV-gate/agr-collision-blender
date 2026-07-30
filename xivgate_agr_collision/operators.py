@@ -144,14 +144,21 @@ def generate_for_objects(
         settings,
         destination_collection=destination_collection,
     )
-    report = validation.validate_colliders(
-        colliders,
-        expected_base=source_data.name,
-        triangle_budget=budget,
-    )
-    if not report.valid:
+    try:
+        report = validation.validate_colliders(
+            colliders,
+            expected_base=source_data.name,
+            triangle_budget=budget,
+        )
+        if not report.valid:
+            raise RuntimeError(report.errors[0])
+    except Exception:
         _remove_objects(colliders)
-        raise RuntimeError(report.errors[0])
+        if (
+                destination_collection is None
+                and bpy.data.collections.get(collection.name) is collection):
+            bpy.data.collections.remove(collection)
+        raise
 
     settings.last_source = source_data.name
     settings.last_colliders = len(result.hulls)
