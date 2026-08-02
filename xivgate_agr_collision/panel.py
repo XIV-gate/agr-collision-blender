@@ -115,12 +115,21 @@ class AGR_PT_collider_advanced(bpy.types.Panel):
 
         repair = layout.box()
         repair.label(text="Geometry Preprocessing", icon="MESH_DATA")
-        repair.prop(settings, "fuse_sources")
-        fuse = repair.column()
+        repair.prop(settings, "destructive_preprocess")
+        if not settings.destructive_preprocess:
+            repair.label(
+                text="Lossless: no component removal or broad source fusion",
+                icon="LOCKED",
+            )
+        controls = repair.column()
+        controls.enabled = settings.destructive_preprocess
+        controls.prop(settings, "fuse_sources")
+        fuse = controls.column()
         fuse.enabled = settings.fuse_sources
         fuse.prop(settings, "fuse_distance")
-        repair.prop(settings, "skip_thin")
-        thin = repair.column()
+        controls.prop(settings, "min_feature")
+        controls.prop(settings, "skip_thin")
+        thin = controls.column()
         thin.enabled = settings.skip_thin
         thin.prop(settings, "thin_threshold")
 
@@ -135,6 +144,7 @@ class AGR_PT_collider_advanced(bpy.types.Panel):
 
         display = layout.box()
         display.label(text="Viewport Output", icon="HIDE_OFF")
+        display.prop(settings, "show_progress_console")
         display.prop(settings, "wire_display")
         display.prop(settings, "hide_sources")
 

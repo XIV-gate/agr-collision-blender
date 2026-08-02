@@ -13,6 +13,14 @@ from bpy.props import (
 
 
 class AGRCollisionSettings(bpy.types.PropertyGroup):
+    destructive_preprocess: BoolProperty(
+        name="Allow Topology-Changing Preprocess",
+        description=(
+            "Explicitly allow source fusion and removal of separate small or "
+            "thin components; keep disabled for lossless collision generation"
+        ),
+        default=False,
+    )
     tolerance: FloatProperty(
         name="Tolerance",
         description="Maximum allowed collision deviation; 0.10 m is the strict universal AGR limit",
@@ -25,7 +33,10 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
     )
     min_feature: FloatProperty(
         name="Min Feature",
-        description="Separate details smaller than this size may be removed during preprocessing",
+        description=(
+            "When topology-changing preprocessing is explicitly enabled, "
+            "separate details smaller than this size may be removed"
+        ),
         default=0.10,
         min=0.01,
         max=1.0,
@@ -39,7 +50,7 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
             "Merge nearby vertices in the combined hidden proxy before volume repair; "
             "this can reconnect walls and other parts split across source objects"
         ),
-        default=True,
+        default=False,
     )
     fuse_distance: FloatProperty(
         name="Fuse Distance",
@@ -54,7 +65,7 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
     skip_thin: BoolProperty(
         name="Skip Separate Thin Parts",
         description="Ignore separate thin components such as canopies and fences; the largest component is never removed",
-        default=True,
+        default=False,
     )
     thin_threshold: FloatProperty(
         name="Thin Threshold",
@@ -114,6 +125,14 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
         name="Hide Sources After Generation",
         description="Hide selected visual sources after a successful generation",
         default=False,
+    )
+    show_progress_console: BoolProperty(
+        name="Show Progress Console",
+        description=(
+            "Open a temporary console and print a heartbeat while collision "
+            "generation is running"
+        ),
+        default=True,
     )
 
     last_status: StringProperty(

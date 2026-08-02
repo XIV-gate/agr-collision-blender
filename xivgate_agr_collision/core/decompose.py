@@ -1736,13 +1736,13 @@ def _run_attempt(source, settings, seed):
                         coverage_deviation,
                     )
                 )
-                sample_count = min(
-                    len(source.vertices) + len(source.faces),
-                    25000,
-                )
-                severe_coverage_loss = (
-                    uncovered_samples > max(8, int(sample_count * 0.10))
-                )
+                # Coverage is a safety invariant, not a quality score.  A
+                # small detached architectural component must not disappear
+                # merely because it contributes less than a percentage of a
+                # large proxy.  Two samples are tolerated for numerical edge
+                # cases; anything more outside the user tolerance rejects the
+                # whole candidate and leaves the previous UCX set untouched.
+                severe_coverage_loss = uncovered_samples > 2
                 if severe_coverage_loss:
                     complete = False
 

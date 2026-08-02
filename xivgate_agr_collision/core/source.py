@@ -500,7 +500,11 @@ def collect_objects(context, settings, objects, name=None):
         raw_vertices,
         raw_faces,
         settings.tolerance,
-        settings.fuse_distance if settings.fuse_sources else 0.0001,
+        (
+            settings.fuse_distance
+            if settings.destructive_preprocess and settings.fuse_sources
+            else 0.0001
+        ),
     )
     proxy_vertices, proxy_faces = _remove_degenerate_and_duplicate_faces(
         repaired_vertices,
@@ -510,8 +514,8 @@ def collect_objects(context, settings, objects, name=None):
     proxy_vertices, proxy_faces, skipped = _filter_components(
         proxy_vertices,
         proxy_faces,
-        settings.min_feature,
-        settings.skip_thin,
+        settings.min_feature if settings.destructive_preprocess else 0.0,
+        settings.skip_thin if settings.destructive_preprocess else False,
         settings.thin_threshold,
     )
     if len(proxy_faces) == 0:

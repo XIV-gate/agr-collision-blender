@@ -2,7 +2,13 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Blender operators for analysis, generation, validation and cleanup.
 
+import ctypes
+import datetime
+import os
+import sys
+import threading
 import time
+import traceback
 
 import bpy
 
@@ -11,6 +17,131 @@ from .core import naming
 from .core import source
 from .core import validation
 from . import translations
+
+
+def _console_is_visible():
+    if os.name != "nt":
+        return False
+    try:
+        handle = ctypes.windll.kernel32.GetConsoleWindow()
+        return bool(handle and ctypes.windll.user32.IsWindowVisible(handle))
+    except Exception:
+        return False
+
+
+def _open_progress_console():
+    if bpy.app.background or os.name != "nt" or _console_is_visible():
+        return False
+    try:
+        if bpy.ops.wm.console_toggle.poll():
+            bpy.ops.wm.console_toggle()
+            ctypes.windll.kernel32.SetConsoleTitleW(
+                "AGR Collision - progress")
+            return True
+    except Exception:
+        traceback.print_exc()
+    return False
+
+
+def _close_progress_console_later(opened_by_us):
+    if not opened_by_us:
+        return
+
+    def close_console():
+        try:
+            if _console_is_visible() and bpy.ops.wm.console_toggle.poll():
+                bpy.ops.wm.console_toggle()
+        except Exception:
+            traceback.print_exc()
+        return None
+
+    bpy.app.timers.register(close_console, first_interval=1.0)
+
+
+def _console_progress(percent, message):
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+    print("[AGR Collision {}] {:>3}%  {}".format(
+        timestamp, int(percent), message), flush=True)
+    sys.stdout.flush()
+
+
+class _ProgressSession:
+    """Keep console feedback alive while synchronous decomposition runs."""
+
+    def __init__(self, context, enabled, label):
+        self.context = context
+        self.enabled = bool(enabled)
+        self.label = str(label)
+        self.percent = 0.0
+        self.message = "Starting"
+        self.started = time.monotonic()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        try:
+            self.context.window_manager.progress_begin(0, 100)
+        except Exception:
+            pass
+        if self.enabled:
+            _console_progress(0, "{} - starting".format(self.label))
+            self._thread = threading.Thread(
+                target=self._heartbeat,
+                name="AGR-Collision-Progress",
+                daemon=True,
+            )
+            self._thread.start()
+        return self.update
+
+    def update(self, percent, message):
+        with self._lock:
+            self.percent = max(0.0, min(100.0, float(percent)))
+            self.message = str(message)
+            current = self.percent
+            current_message = self.message
+        try:
+            self.context.window_manager.progress_update(current)
+            if self.context.workspace:
+                self.context.workspace.status_text_set(
+                    "AGR Collision {:>3}% - {}".format(
+                        int(current), current_message))
+        except Exception:
+            pass
+        if self.enabled:
+            _console_progress(current, current_message)
+
+    def _heartbeat(self):
+        while not self._stop.wait(5.0):
+            with self._lock:
+                percent = self.percent
+                message = self.message
+            elapsed = int(time.monotonic() - self.started)
+            _console_progress(
+                percent,
+                "{} - still working ({}s elapsed)".format(
+                    message, elapsed),
+            )
+
+    def __exit__(self, exc_type, exc, _traceback):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.25)
+        try:
+            self.context.window_manager.progress_end()
+            if self.context.workspace:
+                self.context.workspace.status_text_set(None)
+        except Exception:
+            pass
+        if self.enabled:
+            _console_progress(
+                100,
+                "{} - {} after {:.1f}s".format(
+                    self.label,
+                    "failed" if exc_type else "finished",
+                    time.monotonic() - self.started,
+                ),
+            )
 
 
 def _safe_collection_name(base):
@@ -91,11 +222,37 @@ def _create_collider_collection(
             bpy.data.collections.remove(collection)
         raise
 
-    _remove_objects(old_colliders)
+    old_names = []
+    for index, ob in enumerate(old_colliders, 1):
+        old_names.append((ob, ob.name, ob.data.name))
+        ob.name = "__AGR_COLLISION_BACKUP_{:03d}".format(index)
+        ob.data.name = "__AGR_COLLISION_BACKUP_MESH_{:03d}".format(index)
     for ob, desired_name in zip(created, desired_names):
         ob.data.name = desired_name
         ob.name = desired_name
-    for old_collection in old_collections:
+    return collection, created, {
+        "old_colliders": old_colliders,
+        "old_collections": old_collections,
+        "old_names": old_names,
+        "owns_collection": owns_collection,
+    }
+
+
+def _rollback_collider_swap(collection, created, transaction):
+    _remove_objects(created)
+    for ob, object_name, mesh_name in transaction["old_names"]:
+        if ob.name in bpy.data.objects:
+            ob.name = object_name
+            ob.data.name = mesh_name
+    if (
+            transaction["owns_collection"]
+            and bpy.data.collections.get(collection.name) is collection):
+        bpy.data.collections.remove(collection)
+
+
+def _commit_collider_swap(collection, source_name, transaction):
+    _remove_objects(transaction["old_colliders"])
+    for old_collection in transaction["old_collections"]:
         if (
             old_collection.users == 0
             or (
@@ -104,15 +261,13 @@ def _create_collider_collection(
             )
         ):
             bpy.data.collections.remove(old_collection)
-
-    if owns_collection:
-        collection.name = _safe_collection_name(source_data.name)
-    return collection, created
+    if transaction["owns_collection"]:
+        collection.name = _safe_collection_name(source_name)
 
 
 def generate_for_objects(
         context, objects, base_name, destination_collection=None,
-        settings=None):
+        settings=None, progress=None):
     """Generate one UCX set for an explicit proxy list.
 
     This is the stable integration entry point used by AGR Prepare. It avoids
@@ -120,9 +275,17 @@ def generate_for_objects(
     prepared render mesh in the same generated collection.
     """
     settings = settings or context.scene.xivgate_agr_collision
+    progress = progress or (lambda _percent, _message: None)
+    progress(5, "Collecting collision source geometry")
     source_data = source.collect_objects(
         context, settings, objects, name=base_name)
+    progress(
+        20,
+        "Searching convex decomposition for {:,} source triangles".format(
+            source_data.raw_triangles),
+    )
     result = decompose.decompose(source_data, settings)
+    progress(75, "Checking decomposition completeness and triangle budget")
     if not result.complete:
         raise RuntimeError(result.warnings[-1])
     if not result.hulls:
@@ -137,7 +300,7 @@ def generate_for_objects(
             )
         )
 
-    collection, colliders = _create_collider_collection(
+    collection, colliders, transaction = _create_collider_collection(
         context,
         source_data,
         result,
@@ -145,6 +308,7 @@ def generate_for_objects(
         destination_collection=destination_collection,
     )
     try:
+        progress(88, "Validating convexity, closure, intersections and names")
         report = validation.validate_colliders(
             colliders,
             expected_base=source_data.name,
@@ -153,12 +317,10 @@ def generate_for_objects(
         if not report.valid:
             raise RuntimeError(report.errors[0])
     except Exception:
-        _remove_objects(colliders)
-        if (
-                destination_collection is None
-                and bpy.data.collections.get(collection.name) is collection):
-            bpy.data.collections.remove(collection)
+        _rollback_collider_swap(collection, colliders, transaction)
         raise
+    _commit_collider_swap(collection, source_data.name, transaction)
+    progress(98, "Committing validated UCX set atomically")
 
     settings.last_source = source_data.name
     settings.last_colliders = len(result.hulls)
@@ -233,20 +395,30 @@ class AGR_OT_generate(bpy.types.Operator):
         settings = context.scene.xivgate_agr_collision
         settings.last_status = translations.iface("Building proxy...")
         started = time.perf_counter()
+        opened_console = (
+            _open_progress_console()
+            if settings.show_progress_console else False)
 
         try:
-            settings.last_status = translations.iface(
-                "Searching convex decomposition..."
-            )
-            selected = source.selected_source_objects(context)
-            active = context.view_layer.objects.active
-            base_name = active.name if active in selected else selected[0].name
-            generated = generate_for_objects(
-                context,
-                selected,
-                base_name=base_name,
-                settings=settings,
-            )
+            with _ProgressSession(
+                    context, settings.show_progress_console,
+                    "Generate / Regenerate") as progress:
+                settings.last_status = translations.iface(
+                    "Searching convex decomposition..."
+                )
+                progress(2, "Reading selected proxy objects")
+                selected = source.selected_source_objects(context)
+                active = context.view_layer.objects.active
+                base_name = (
+                    active.name if active in selected else selected[0].name)
+                generated = generate_for_objects(
+                    context,
+                    selected,
+                    base_name=base_name,
+                    settings=settings,
+                    progress=progress,
+                )
+                progress(100, "Validated UCX set is ready")
             source_data = generated["source"]
             result = generated["decomposition"]
 
@@ -278,6 +450,8 @@ class AGR_OT_generate(bpy.types.Operator):
             settings.last_status = translations.iface("Generation failed")
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
+        finally:
+            _close_progress_console_later(opened_console)
 
 
 class AGR_OT_validate(bpy.types.Operator):

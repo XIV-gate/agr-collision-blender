@@ -63,7 +63,15 @@ Version 1.2.1 guarantees transactional scene cleanup when final collider
 validation raises or fails. AGR Collision remains scene-only: it creates no
 cache, report or output folders; Prepare and Output own all filesystem paths.
 
-Current version: 1.2.1.
+Version 1.2.2 makes lossless generation the explicit default: no source
+component is removed and no broad source fusion is allowed unless the user
+enables destructive advanced preprocessing. Source vertices and face centres
+must remain covered by the generated hull set. Overlapping sources can share a
+validated covering result, but nearby sources with a real air gap remain
+separate; the regression suite protects a 10 mm gap and a detached 0.2 m
+detail.
+
+Current version: 1.2.2.
 
 ## Default AGR settings
 
