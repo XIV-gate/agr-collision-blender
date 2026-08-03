@@ -17,6 +17,10 @@ from xivgate_agr_collision.core import decompose
 
 
 xivgate_agr_collision.register()
+settings = bpy.context.scene.xivgate_agr_collision
+assert not settings.destructive_preprocess
+assert not settings.fuse_sources
+assert not settings.skip_thin
 bpy.ops.mesh.primitive_cube_add(size=2.0, location=(1.0, 2.0, 3.0))
 proxy = bpy.context.object
 proxy.name = "Tower Collision Proxy"

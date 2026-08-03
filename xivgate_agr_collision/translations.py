@@ -14,6 +14,13 @@ _RU_DEFAULT = {
     "Geometry Preprocessing": "Предварительная обработка геометрии",
     "Convex Search Limits": "Ограничения поиска выпуклых частей",
     "Viewport Output": "Отображение результата",
+    "Manual Cleanup": "Ручная очистка",
+    "Topology-changing preprocess is enabled": (
+        "Включена предобработка с изменением топологии"
+    ),
+    "Lossless components; validated replacement only": (
+        "Компоненты сохраняются; замена только после проверки"
+    ),
     "Source": "Источник",
     "No active mesh": "Нет активного меш-объекта",
     "Accuracy": "Точность",

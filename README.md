@@ -71,7 +71,13 @@ validated covering result, but nearby sources with a real air gap remain
 separate; the regression suite protects a 10 mm gap and a detached 0.2 m
 detail.
 
-Current version: 1.2.2.
+Version 1.2.3 makes the safety boundary explicit in the main panel.  The
+effective quality controls stay visible, while topology-changing `Min Feature`
+and collider removal live only in the collapsed advanced panel.  The main
+action cannot accidentally delete the current UCX set: regeneration still
+builds and validates a candidate before atomically replacing it.
+
+Current version: 1.2.3.
 
 ## Default AGR settings
 

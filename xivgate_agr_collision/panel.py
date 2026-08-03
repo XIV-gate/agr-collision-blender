@@ -54,8 +54,17 @@ class AGR_PT_collider(bpy.types.Panel):
         quality = layout.box()
         quality.label(text="Collision Quality", icon="MODIFIER")
         quality.prop(settings, "tolerance")
-        quality.prop(settings, "min_feature")
         quality.prop(settings, "gap")
+        if settings.destructive_preprocess:
+            quality.label(
+                text="Topology-changing preprocess is enabled",
+                icon="ERROR",
+            )
+        else:
+            quality.label(
+                text="Lossless components; validated replacement only",
+                icon="LOCKED",
+            )
 
         actions = layout.box()
         actions.label(text="Generate & Validate", icon="MESH_ICOSPHERE")
@@ -68,10 +77,6 @@ class AGR_PT_collider(bpy.types.Panel):
             "xivgate_agr_collision.validate",
             text="Validate",
             icon="CHECKMARK")
-        row.operator(
-            "xivgate_agr_collision.remove_generated",
-            text="Remove",
-            icon="TRASH")
 
         if settings.last_source:
             result = layout.box()
@@ -147,6 +152,13 @@ class AGR_PT_collider_advanced(bpy.types.Panel):
         display.prop(settings, "show_progress_console")
         display.prop(settings, "wire_display")
         display.prop(settings, "hide_sources")
+
+        cleanup = layout.box()
+        cleanup.label(text="Manual Cleanup", icon="TRASH")
+        cleanup.operator(
+            "xivgate_agr_collision.remove_generated",
+            text="Remove Generated",
+            icon="TRASH")
 
 
 CLASSES = (
