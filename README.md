@@ -19,6 +19,11 @@ License: **GPL-3.0-or-later**
 Generated objects use the form `UCX_<SourceName>_001` and are placed in an
 `AGR_COLLISION__<SourceName>` collection.
 
+Version 1.2.4 assigns every generated UCX object the exact origin of its base
+render object. AGR Prepare passes the shared source-derived Main/Glass pivot;
+standalone generation inherits the active source object's origin. Hull world
+geometry is counter-translated and therefore does not move.
+
 ## Geometry pipeline
 
 - combines evaluated selected meshes in world space without modifying sources;
@@ -77,7 +82,7 @@ and collider removal live only in the collapsed advanced panel.  The main
 action cannot accidentally delete the current UCX set: regeneration still
 builds and validates a candidate before atomically replacing it.
 
-Current version: 1.2.3.
+Current version: 1.2.4.
 
 ## Default AGR settings
 

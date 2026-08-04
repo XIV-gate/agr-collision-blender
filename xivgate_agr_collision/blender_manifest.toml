@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "xivgate_agr_collision"
-version = "1.2.3"
+version = "1.2.4"
 name = "AGR Collision"
 tagline = "Generate convex AGR and Unreal UCX collision sets"
 maintainer = "XIVgate"

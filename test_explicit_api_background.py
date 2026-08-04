@@ -7,6 +7,7 @@ from pathlib import Path
 
 import bpy
 import numpy as np
+from mathutils import Vector
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -34,6 +35,7 @@ result = operators.generate_for_objects(
     [proxy],
     base_name="SM_TestTower_Main",
     destination_collection=destination,
+    origin_world=(7.0, -4.0, 0.5),
     progress=lambda percent, message: progress_events.append(
         (float(percent), str(message))),
 )
@@ -42,6 +44,20 @@ colliders = result["colliders"]
 assert colliders
 assert all(obj.name.startswith("UCX_SM_TestTower_Main_") for obj in colliders)
 assert all(obj in destination.objects[:] for obj in colliders)
+assert all(
+    (obj.matrix_world.translation - Vector((7.0, -4.0, 0.5))).length < 1.0e-7
+    for obj in colliders
+)
+assert result["origin_world"] == [7.0, -4.0, 0.5]
+first_points = np.asarray([
+    tuple(obj.matrix_world @ vertex.co)
+    for obj in colliders
+    for vertex in obj.data.vertices
+])
+expected_first_points = np.concatenate([
+    vertices for vertices, _faces in result["decomposition"].hulls
+])
+assert np.allclose(first_points, expected_first_points, atol=1.0e-5)
 assert proxy.data.as_pointer() == source_pointer
 assert not proxy.hide_get()
 assert result["validation"].valid

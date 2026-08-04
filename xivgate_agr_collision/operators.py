@@ -11,6 +11,7 @@ import time
 import traceback
 
 import bpy
+from mathutils import Vector
 
 from .core import decompose
 from .core import naming
@@ -174,7 +175,8 @@ def _remove_objects(objects):
 
 
 def _create_collider_collection(
-        context, source_data, result, settings, destination_collection=None):
+        context, source_data, result, settings, destination_collection=None,
+        origin_world=None):
     old_colliders = _generated_colliders(context.scene, source_data.name)
     old_collections = {
         owner
@@ -190,6 +192,8 @@ def _create_collider_collection(
         collection = destination_collection
     created = []
     desired_names = []
+    pivot = Vector(
+        origin_world if origin_world is not None else (0.0, 0.0, 0.0))
 
     try:
         for index, (vertices, faces) in enumerate(result.hulls, 1):
@@ -201,12 +205,20 @@ def _create_collider_collection(
                     )
                 )
             mesh = bpy.data.meshes.new("AGR_TMP_COLLIDER_MESH_{:03d}".format(index))
-            mesh.from_pydata(vertices.tolist(), [], faces.tolist())
+            mesh.from_pydata([
+                (
+                    float(vertex[0]) - pivot.x,
+                    float(vertex[1]) - pivot.y,
+                    float(vertex[2]) - pivot.z,
+                )
+                for vertex in vertices
+            ], [], faces.tolist())
             mesh.materials.clear()
             mesh.update(calc_edges=True)
 
             ob = bpy.data.objects.new("AGR_TMP_COLLIDER_{:03d}".format(index), mesh)
             collection.objects.link(ob)
+            ob.matrix_world.translation = pivot
             ob[naming.SOURCE_PROP] = source_data.name
             ob["agr_generated"] = True
             ob["agr_source_objects"] = ", ".join(source_data.object_names)
@@ -267,7 +279,7 @@ def _commit_collider_swap(collection, source_name, transaction):
 
 def generate_for_objects(
         context, objects, base_name, destination_collection=None,
-        settings=None, progress=None):
+        settings=None, progress=None, origin_world=None):
     """Generate one UCX set for an explicit proxy list.
 
     This is the stable integration entry point used by AGR Prepare. It avoids
@@ -276,6 +288,10 @@ def generate_for_objects(
     """
     settings = settings or context.scene.xivgate_agr_collision
     progress = progress or (lambda _percent, _message: None)
+    pivot = Vector(
+        origin_world
+        if origin_world is not None
+        else objects[0].matrix_world.translation)
     progress(5, "Collecting collision source geometry")
     source_data = source.collect_objects(
         context, settings, objects, name=base_name)
@@ -306,6 +322,7 @@ def generate_for_objects(
         result,
         settings,
         destination_collection=destination_collection,
+        origin_world=pivot,
     )
     try:
         progress(88, "Validating convexity, closure, intersections and names")
@@ -335,6 +352,7 @@ def generate_for_objects(
         "decomposition": result,
         "validation": report,
         "budget": budget,
+        "origin_world": list(pivot),
     }
 
 
