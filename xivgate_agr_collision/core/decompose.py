@@ -1285,10 +1285,21 @@ def _inset_convex_piece(piece, distance):
                     intersections.append(point)
 
     if len(intersections) < 4:
-        return piece
+        # The requested clearance consumed this sliver completely. Returning
+        # the pre-inset piece would reintroduce the exact zero-volume fragment
+        # the clearance operation was meant to eliminate.
+        return _analyse_piece(Piece(
+            vertices=np.empty((0, 3), dtype=np.float64),
+            faces=np.empty((0, 3), dtype=np.int32),
+            depth=piece.depth,
+        ))
     hull = _convex_hull(np.asarray(intersections, dtype=np.float64))
     if hull is None:
-        return piece
+        return _analyse_piece(Piece(
+            vertices=np.empty((0, 3), dtype=np.float64),
+            faces=np.empty((0, 3), dtype=np.int32),
+            depth=piece.depth,
+        ))
     return _analyse_piece(
         Piece(
             vertices=hull[0],
