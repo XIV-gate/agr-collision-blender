@@ -1736,6 +1736,10 @@ def _run_attempt(source, settings, seed):
                 )
                 for piece in convex_pieces
             ]
+            convex_pieces = [
+                piece for piece in convex_pieces
+                if not _is_ignorable_fragment(piece, settings)
+            ]
             # Blender stores generated mesh coordinates as float32. Resolve
             # once more after the final inset so conversion-level contacts
             # cannot turn into a small positive-volume penetration.
@@ -1745,6 +1749,10 @@ def _run_attempt(source, settings, seed):
                     settings,
                 )
             )
+            convex_pieces = [
+                piece for piece in convex_pieces
+                if not _is_ignorable_fragment(piece, settings)
+            ]
             if not inset_overlap_complete:
                 complete = False
                 warnings.append(
