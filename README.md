@@ -24,7 +24,9 @@ render object. AGR Prepare passes the shared source-derived Main/Glass pivot;
 standalone generation inherits the active source object's origin. Hull world
 geometry is counter-translated and therefore does not move.
 
-Version 1.2.5 reconstructs the final collider clearance from shifted support
+Version 1.2.6 discards any sub-clearance fragment that collapses to a plane
+after inset, preventing invalid zero-volume UCX leftovers. Version 1.2.5
+reconstructs the final collider clearance from shifted support
 planes. Clearance is now a constant world-space distance on every face; tall
 or otherwise high-aspect-ratio hulls no longer lose centimetres at their ends
 because of uniform scaling around the hull centre.

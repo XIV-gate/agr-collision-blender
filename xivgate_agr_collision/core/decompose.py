@@ -1397,6 +1397,15 @@ def _piece_extents(piece):
 
 def _is_ignorable_fragment(piece, settings):
     extents = _piece_extents(piece)
+    # A support-plane inset may collapse an extremely thin leftover into a
+    # plane.  Such a fragment is not a convex volume and would export as an
+    # invalid UCX object with duplicate vertices.
+    collapse_epsilon = max(
+        1.0e-6,
+        float(settings.gap) * 0.5 + 1.0e-7,
+    )
+    if float(extents[-1]) <= collapse_epsilon:
+        return True
     if float(extents[0]) <= settings.min_feature:
         return True
     return bool(

@@ -225,6 +225,19 @@ assert np.allclose(
     np.asarray((0.1198, 0.9998, 54.9998)),
     atol=2.0e-6,
 ), fixed_bounds
+collapsed_piece = decompose.Piece(
+    np.asarray(
+        [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (1.0, 1.0, 0.0),
+        ],
+        dtype=np.float64,
+    ),
+    np.asarray(((0, 1, 2), (1, 3, 2)), dtype=np.int32),
+)
+assert decompose._is_ignorable_fragment(collapsed_piece, settings)
 
 # Close is not the same as overlapping.  A real air gap must survive
 # regeneration: two source boxes separated by 10 mm may not be replaced by
