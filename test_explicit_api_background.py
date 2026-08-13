@@ -188,6 +188,44 @@ assert overlap_signatures == {
     for obj in (overlap_left, overlap_right)
 }
 
+# A fixed clearance must stay fixed on high-aspect-ratio hulls.  The old
+# uniform-scale implementation shortened this 55 m tall, 0.12 m thin prism by
+# roughly 92 mm when asked for a 0.1 mm inset.
+slender_vertices = np.asarray(
+    [
+        (0.0, 0.0, 0.0),
+        (0.12, 0.0, 0.0),
+        (0.12, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 55.0),
+        (0.12, 0.0, 55.0),
+        (0.12, 1.0, 55.0),
+        (0.0, 1.0, 55.0),
+    ],
+    dtype=np.float64,
+)
+slender_faces = np.asarray(
+    [
+        (0, 2, 1), (0, 3, 2),
+        (4, 5, 6), (4, 6, 7),
+        (0, 1, 5), (0, 5, 4),
+        (1, 2, 6), (1, 6, 5),
+        (2, 3, 7), (2, 7, 6),
+        (3, 0, 4), (3, 4, 7),
+    ],
+    dtype=np.int32,
+)
+slender_piece = decompose._analyse_piece(
+    decompose.Piece(vertices=slender_vertices, faces=slender_faces)
+)
+fixed_inset = decompose._inset_convex_piece(slender_piece, 0.0001)
+fixed_bounds = fixed_inset.vertices.max(axis=0) - fixed_inset.vertices.min(axis=0)
+assert np.allclose(
+    fixed_bounds,
+    np.asarray((0.1198, 0.9998, 54.9998)),
+    atol=2.0e-6,
+), fixed_bounds
+
 # Close is not the same as overlapping.  A real air gap must survive
 # regeneration: two source boxes separated by 10 mm may not be replaced by
 # one broad hull that silently fills the gap.

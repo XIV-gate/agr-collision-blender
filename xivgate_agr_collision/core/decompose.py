@@ -1246,26 +1246,47 @@ def _convex_test_samples(piece):
 
 
 def _inset_convex_piece(piece, distance):
-    """Scale around an interior point so every support plane moves inward."""
+    """Move every support plane inward by one fixed world-space distance.
+
+    Uniform scaling is not a geometric inset.  On a long, thin hull its scale
+    factor is dictated by the thinnest support distance, so a 0.1 mm clearance
+    can shorten a 55 m prism by several centimetres.  Reconstructing the
+    polyhedron from the shifted half-spaces keeps the clearance independent of
+    aspect ratio and preserves the ends of tall architectural collision parts.
+    """
     if distance <= 0.0:
         return piece
     planes = _convex_planes(piece)
     if len(planes) < 4:
         return piece
-    center = piece.vertices.mean(axis=0)
-    support_distances = [
-        float(np.dot(point - center, normal))
-        for point, normal in planes
-    ]
-    minimum_support = min(support_distances)
-    if minimum_support <= distance * 1.01:
+
+    normals = np.asarray(
+        [normal for _point, normal in planes],
+        dtype=np.float64,
+    )
+    offsets = np.asarray(
+        [float(np.dot(point, normal)) - distance for point, normal in planes],
+        dtype=np.float64,
+    )
+    epsilon = max(distance * 1.0e-5, 1.0e-9)
+    intersections = []
+    for left in range(len(planes) - 2):
+        for middle in range(left + 1, len(planes) - 1):
+            for right in range(middle + 1, len(planes)):
+                matrix = normals[[left, middle, right]]
+                determinant = float(np.linalg.det(matrix))
+                if abs(determinant) <= 1.0e-10:
+                    continue
+                point = np.linalg.solve(
+                    matrix,
+                    offsets[[left, middle, right]],
+                )
+                if np.all(normals @ point <= offsets + epsilon):
+                    intersections.append(point)
+
+    if len(intersections) < 4:
         return piece
-    # Uniform scaling moves a face by (1-scale) times its support distance.
-    # Using the smallest support guarantees at least the requested gap on
-    # every face while keeping the polyhedron exactly convex.
-    scale = 1.0 - distance / minimum_support
-    inset_vertices = center + (piece.vertices - center) * scale
-    hull = _convex_hull(inset_vertices)
+    hull = _convex_hull(np.asarray(intersections, dtype=np.float64))
     if hull is None:
         return piece
     return _analyse_piece(
