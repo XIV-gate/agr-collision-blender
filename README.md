@@ -31,6 +31,12 @@ planes. Clearance is now a constant world-space distance on every face; tall
 or otherwise high-aspect-ratio hulls no longer lose centimetres at their ends
 because of uniform scaling around the hull centre.
 
+Version 1.2.7 makes the viewport controls reactive: `Wire Display` immediately
+updates existing generated colliders, and `Hide Sources After Generation` can
+both hide and restore their source objects. It also completes the Russian
+translation coverage for current labels and tooltips and clarifies that the
+optional progress console opens during generation.
+
 ## Geometry pipeline
 
 - combines evaluated selected meshes in world space without modifying sources;
@@ -89,7 +95,7 @@ and collider removal live only in the collapsed advanced panel.  The main
 action cannot accidentally delete the current UCX set: regeneration still
 builds and validates a candidate before atomically replacing it.
 
-Current version: 1.2.5.
+Current version: 1.2.7.
 
 ## Default AGR settings
 

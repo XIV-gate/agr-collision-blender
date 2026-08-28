@@ -12,6 +12,26 @@ from bpy.props import (
 )
 
 
+def _update_wire_display(settings, context):
+    if context is None or context.scene is None:
+        return
+    from . import operators
+
+    operators.apply_wire_display(context.scene, settings.wire_display)
+
+
+def _update_source_visibility(settings, context):
+    if context is None or context.scene is None:
+        return
+    from . import operators
+
+    operators.apply_source_visibility(
+        context.scene,
+        settings.hide_sources,
+        view_layer=context.view_layer,
+    )
+
+
 class AGRCollisionSettings(bpy.types.PropertyGroup):
     destructive_preprocess: BoolProperty(
         name="Allow Topology-Changing Preprocess",
@@ -120,17 +140,19 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
         name="Wire Display",
         description="Display generated colliders as wireframe objects",
         default=True,
+        update=_update_wire_display,
     )
     hide_sources: BoolProperty(
         name="Hide Sources After Generation",
         description="Hide selected visual sources after a successful generation",
         default=False,
+        update=_update_source_visibility,
     )
     show_progress_console: BoolProperty(
-        name="Show Progress Console",
+        name="Open Progress Console During Generation",
         description=(
-            "Open a temporary console and print a heartbeat while collision "
-            "generation is running"
+            "Open a temporary console while collision generation is running "
+            "and print progress heartbeats"
         ),
         default=True,
     )

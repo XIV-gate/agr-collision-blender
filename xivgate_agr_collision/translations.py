@@ -21,6 +21,20 @@ _RU_DEFAULT = {
     "Lossless components; validated replacement only": (
         "Компоненты сохраняются; замена только после проверки"
     ),
+    "Allow Topology-Changing Preprocess": (
+        "Разрешить предобработку с изменением топологии"
+    ),
+    (
+        "Explicitly allow source fusion and removal of separate small or "
+        "thin components; keep disabled for lossless collision generation"
+    ): (
+        "Явно разрешает объединение исходников и удаление отдельных мелких "
+        "или тонких компонентов; оставьте выключенным для генерации коллизии "
+        "без потерь"
+    ),
+    "Lossless: no component removal or broad source fusion": (
+        "Без потерь: компоненты не удаляются, исходники не объединяются целиком"
+    ),
     "Source": "Источник",
     "No active mesh": "Нет активного меш-объекта",
     "Accuracy": "Точность",
@@ -42,6 +56,13 @@ _RU_DEFAULT = {
     "Separate details smaller than this size may be removed during preprocessing": (
         "Отдельные детали меньше этого размера могут быть удалены "
         "при предварительной обработке"
+    ),
+    (
+        "When topology-changing preprocessing is explicitly enabled, "
+        "separate details smaller than this size may be removed"
+    ): (
+        "Если предобработка с изменением топологии явно включена, отдельные "
+        "детали меньше этого размера могут быть удалены"
     ),
     "Fuse Selected Geometry": "Объединить выбранную геометрию",
     (
@@ -98,6 +119,17 @@ _RU_DEFAULT = {
     "Hide selected visual sources after a successful generation": (
         "Скрывает выбранные визуальные исходники после успешной генерации"
     ),
+    "Open Progress Console During Generation": (
+        "Открывать консоль прогресса при генерации"
+    ),
+    (
+        "Open a temporary console while collision generation is running "
+        "and print progress heartbeats"
+    ): (
+        "Открывает временную консоль на время генерации коллизии и выводит "
+        "периодические сообщения о ходе выполнения"
+    ),
+    "Validate": "Проверить",
     "Last Source": "Последний источник",
     "Last Colliders": "Последние коллайдеры",
     "Last Triangles": "Последние треугольники",
