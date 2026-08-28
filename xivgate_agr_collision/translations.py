@@ -115,9 +115,15 @@ _RU_DEFAULT = {
     "Display generated colliders as wireframe objects": (
         "Отображает созданные коллайдеры в каркасном режиме"
     ),
+    "Toggle wire display for the active AGR collision set": (
+        "Переключает каркасное отображение активного набора коллизии AGR"
+    ),
     "Hide Sources After Generation": "Скрыть исходники после генерации",
     "Hide selected visual sources after a successful generation": (
         "Скрывает выбранные визуальные исходники после успешной генерации"
+    ),
+    "Hide or restore source objects for the active AGR collision set": (
+        "Скрывает или возвращает исходные объекты активного набора коллизии AGR"
     ),
     "Open Progress Console During Generation": (
         "Открывать консоль прогресса при генерации"

@@ -1,115 +1,182 @@
 # AGR Collision
 
-Blender 5.2 extension for generating closed, convex, non-overlapping Unreal
-Engine UCX collision sets from selected architectural meshes.
+Расширение для Blender, которое создаёт из выбранной архитектурной геометрии
+закрытый набор выпуклых коллайдеров AGR и Unreal Engine UCX. Исходные меши не
+изменяются: обработка выполняется на скрытом рабочем представлении, а готовый
+набор проходит автоматическую проверку до замены предыдущего результата.
 
-Author and maintainer: **XIVgate**
-License: **GPL-3.0-or-later**
+- Минимальная версия: Blender 5.2.
+- Проверено в Blender 5.2 LTS.
+- Текущая версия: 1.2.8.
+- Автор и разработчик: XIVgate.
+- Лицензия: GPL-3.0-or-later.
 
-## Current workflow
+Название расширения — **AGR Collision**. `xivgate_agr_collision` — только его
+внутренний технический идентификатор Blender; он используется для папки,
+Python-модуля и защиты от конфликтов с другими расширениями.
 
-1. Select one or more source mesh objects. The active object supplies the UCX
-   base name.
-2. Open **3D Viewport > Sidebar > AGR > AGR Collision**.
-3. Use **Analyze Selected** to inspect the exact hidden working geometry.
-4. Use **Generate / Regenerate** to atomically replace the previous generated
-   collision set.
-5. Use **Validate Colliders** before export.
+## Установка и обновление
 
-Generated objects use the form `UCX_<SourceName>_001` and are placed in an
-`AGR_COLLISION__<SourceName>` collection.
+1. Получите ZIP нужной версии, например `AGR-Collision-1.2.8.zip`.
+2. Откройте `Edit → Preferences → Get Extensions`.
+3. Откройте меню со стрелкой вниз и выберите `Install from Disk`.
+4. Выберите ZIP и убедитесь, что расширение **AGR Collision** включено.
 
-Version 1.2.4 assigns every generated UCX object the exact origin of its base
-render object. AGR Prepare passes the shared source-derived Main/Glass pivot;
-standalone generation inherits the active source object's origin. Hull world
-geometry is counter-translated and therefore does not move.
+Для обновления установите новый ZIP тем же способом поверх предыдущей версии.
+Если в уже открытом Blender осталось старое поведение, выключите и снова
+включите расширение либо перезапустите Blender.
 
-Version 1.2.6 discards any sub-clearance fragment that collapses to a plane
-after inset, preventing invalid zero-volume UCX leftovers. Version 1.2.5
-reconstructs the final collider clearance from shifted support
-planes. Clearance is now a constant world-space distance on every face; tall
-or otherwise high-aspect-ratio hulls no longer lose centimetres at their ends
-because of uniform scaling around the hull centre.
+## Быстрый запуск
 
-Version 1.2.7 makes the viewport controls reactive: `Wire Display` immediately
-updates existing generated colliders, and `Hide Sources After Generation` can
-both hide and restore their source objects. It also completes the Russian
-translation coverage for current labels and tooltips and clarifies that the
-optional progress console opens during generation.
+1. Выделите один или несколько исходных меш-объектов.
+2. Сделайте главным активным тот объект, имя которого должно использоваться в
+   названиях UCX.
+3. Откройте `3D Viewport → N → AGR → AGR Collision`.
+4. Нажмите `Analyze Selected`, чтобы проверить рабочую геометрию.
+5. Нажмите `Generate / Regenerate`.
+6. Перед экспортом нажмите `Validate`.
 
-## Geometry pipeline
+`Analyze Selected` и `Generate / Regenerate` намеренно доступны только при
+текущем выделении исходного меша. Запомненный последний источник не включает
+эти кнопки автоматически.
 
-- combines evaluated selected meshes in world space without modifying sources;
-- fuses nearby vertices before any boundary repair;
-- preserves source coordinates, planes and architectural corners;
-- recalculates closed shell normals outward;
-- ignores connected narrow recesses below `Tolerance`, while retaining external
-  steps and broad facade corners;
-- detects repeated closed sweep/ring topology and decomposes it into logical
-  neighbouring sectors before the generic search;
-- splits concave solids along planes derived from their own reflex edges;
-- connects each intermediate region into one convex hull whenever that hull is
-  proven to remain inside the configured tolerance;
-- separates disconnected islands after every cut, preserving large openings;
-- keeps the largest solid during overlap refinement and applies the minimum
-  `0.0002 m` support-plane gap;
-- optionally removes separate thin details;
-- validates closure, convexity, transforms, naming, intersections and the AGR
-  triangle budget.
+## Что создаёт расширение
 
-The pipeline does not use voxel remeshing.
+Готовые объекты получают имена вида:
 
-## Localization
+```text
+UCX_<ИмяИсходника>_001
+UCX_<ИмяИсходника>_002
+...
+```
 
-The extension includes English source text and a complete Russian translation.
-Interface labels and tooltips follow Blender's independent translation controls
-under **Edit > Preferences > Interface > Translation**.
+При самостоятельной генерации они помещаются в коллекцию
+`AGR_COLLISION__<ИмяИсходника>`. Каждый UCX получает origin базового объекта,
+но его мировая геометрия при этом не смещается.
 
-Version 1.0.1 keeps English as the source UI and documentation language and
-provides native Russian labels and descriptions for every operator.
+Расширение работает только со сценой Blender: оно не создаёт рядом с `.blend`
+кэши, отчёты, временные каталоги или экспортные пакеты.
 
-Version 1.1.0 keeps only source selection, quality, generation and validation
-in the primary panel. Geometry preprocessing, convex-search limits and viewport
-display behavior are grouped under a collapsed advanced panel.
+## Основная панель
 
-Version 1.2.0 adds a selection-independent integration API for AGR Prepare.
-Prepare can pass an explicit collision proxy, request a UCX set named from the
-prepared High Main, and place the validated hulls directly in that High
-package without changing viewport selection or modifying the proxy.
+### Source
 
-Version 1.2.1 guarantees transactional scene cleanup when final collider
-validation raises or fails. AGR Collision remains scene-only: it creates no
-cache, report or output folders; Prepare and Output own all filesystem paths.
+- показывает активный меш;
+- `Analyze Selected` анализирует те же рабочие данные, которые будут переданы
+  генератору;
+- при выделении нескольких объектов они объединяются только во временном
+  рабочем представлении.
 
-Version 1.2.2 makes lossless generation the explicit default: no source
-component is removed and no broad source fusion is allowed unless the user
-enables destructive advanced preprocessing. Source vertices and face centres
-must remain covered by the generated hull set. Overlapping sources can share a
-validated covering result, but nearby sources with a real air gap remain
-separate; the regression suite protects a 10 mm gap and a detached 0.2 m
-detail.
+### Collision Quality
 
-Version 1.2.3 makes the safety boundary explicit in the main panel.  The
-effective quality controls stay visible, while topology-changing `Min Feature`
-and collider removal live only in the collapsed advanced panel.  The main
-action cannot accidentally delete the current UCX set: regeneration still
-builds and validates a candidate before atomically replacing it.
+Параметр | Назначение
+--- | ---
+`Tolerance` | Максимально допустимое отклонение коллизии; стандартный строгий лимит AGR — `0.10 m`
+`Gap` | Минимальный воздушный зазор между соседними выпуклыми оболочками; стандартно `0.0002 m`
 
-Current version: 1.2.7.
+По умолчанию используется режим без потерь: отдельные компоненты не удаляются,
+а широкое объединение исходных частей не выполняется.
 
-## Default AGR settings
+### Generate & Validate
 
-- tolerance: `0.10 m`;
-- minimum feature: `0.10 m`;
-- collider gap: `0.0002 m`;
-- fuse distance: `0.02 m`;
-- optional separate thin-part threshold: `0.05 m`.
+- `Generate / Regenerate` строит новый набор, полностью проверяет его и только
+  после успешной проверки заменяет предыдущие UCX этого источника;
+- при ошибке старый корректный набор остаётся в сцене;
+- `Validate` проверяет имена, выпуклость, замкнутость, пересечения, трансформации
+  и бюджет треугольников AGR.
 
-## Installation
+## Viewport Output
 
-Install the packaged ZIP through **Edit > Preferences > Get Extensions >
-Install from Disk**, then enable **AGR Collision**.
+- `Open Progress Console During Generation` — общая настройка процесса. Во
+  время следующей генерации она открывает временную консоль и выводит сообщения
+  о ходе поиска.
+- `Wire Display` — переключает каркасный режим только у UCX-набора активного
+  исходника.
+- `Hide Sources After Generation` — скрывает или возвращает только исходные
+  объекты активного UCX-набора.
 
-## License
+Для двух последних переключателей активным может быть как исходный меш, так и
+любой созданный для него UCX. Поэтому скрытый исходник можно вернуть, выделив
+его коллайдер. Другие наборы в сцене не изменяются. При повторной генерации
+активный набор сохраняет свой текущий режим отображения.
 
-GPL-3.0-or-later.
+Если для активного исходника UCX ещё не созданы, `Wire Display` и
+`Hide Sources After Generation` задают начальное состояние будущего набора.
+Без активного исходника эти настройки отключены.
+
+## Расширенные настройки
+
+Раскройте `Advanced Collision Settings`.
+
+### Geometry Preprocessing
+
+Параметр | Назначение
+--- | ---
+`Allow Topology-Changing Preprocess` | Явно разрешить операции, способные объединять исходные части или удалять отдельные мелкие компоненты
+`Fuse Selected Geometry` | Объединять близкие вершины общего рабочего представления
+`Fuse Distance` | Максимальное расстояние такого объединения; стандартно `0.02 m`
+`Min Feature` | Размер отдельных деталей, которые разрешено удалить; стандартно `0.10 m`
+`Skip Separate Thin Parts` | Разрешить пропуск отдельных тонких элементов, например козырьков и ограждений
+`Thin Threshold` | Максимальная толщина пропускаемых элементов; стандартно `0.05 m`
+
+Эти параметры заблокированы, пока явно не включён
+`Allow Topology-Changing Preprocess`. Крупнейший компонент никогда не удаляется.
+
+### Convex Search Limits
+
+Параметр | Назначение
+--- | ---
+`Optimization Passes` | Число полных детерминированных вариантов поиска
+`Seed` | Начальное значение для вариантов с равной оценкой
+`Max Parts` | Жёсткий максимум количества UCX-оболочек
+`Search Depth` | Максимальная глубина рекурсивных разделяющих плоскостей
+
+### Manual Cleanup
+
+`Remove Generated` удаляет только набор, связанный с активным или последним
+рабочим источником. Исходная модель не удаляется.
+
+## Как работает геометрический конвейер
+
+- читает evaluated-геометрию выбранных мешей в мировых координатах;
+- сохраняет исходные координаты, архитектурные плоскости и углы;
+- восстанавливает направление замкнутых оболочек;
+- отделяет несвязанные острова после каждого разреза и сохраняет крупные
+  проёмы;
+- ищет плоскости разделения по вогнутым рёбрам самой модели;
+- соединяет промежуточную область в один convex hull только тогда, когда он
+  остаётся внутри заданного `Tolerance`;
+- восстанавливает постоянный мировой зазор по опорным плоскостям, поэтому
+  высокие и вытянутые hull не теряют зазор на концах;
+- отбрасывает фрагменты, которые после inset схлопнулись в плоскость;
+- проверяет полный охват исходной геометрии и допустимый бюджет треугольников.
+
+Воксельный remesh не используется.
+
+## Интеграция с AGR Prepare
+
+AGR Prepare может вызвать генератор через явный API без изменения текущего
+выделения. Он передаёт collision proxy, имя подготовленного High Main,
+целевую коллекцию и общий pivot Main/Glass. Результат размещается прямо в
+подготовленном High-наборе и проходит ту же транзакционную проверку.
+
+## Локализация
+
+Исходный интерфейс написан на английском и содержит полный русский перевод
+названий, кнопок и подсказок. Отображение зависит от независимых параметров
+Blender в `Edit → Preferences → Interface → Translation`.
+
+## Ограничения и примечания
+
+- Генерация работает с mesh-объектами.
+- Активный исходник задаёт базовое имя UCX; остальные выделенные меши входят в
+  тот же рабочий набор.
+- Топологически изменяющая предобработка всегда требует явного включения.
+- На сложной архитектурной геометрии поиск может занять заметное время; ход
+  выполнения показывается в строке состояния и, при необходимости, в консоли.
+- Сгенерированный набор рассчитан на Unreal Engine UCX и требования AGR, но
+  перед экспортом его всё равно следует проверить кнопкой `Validate`.
+
+## Ссылки
+
+- [Репозиторий](https://github.com/XIV-gate/agr-collision-blender)

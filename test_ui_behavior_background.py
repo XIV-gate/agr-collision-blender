@@ -22,6 +22,21 @@ def _unregister_loaded_test_copy():
             pass
 
 
+def _activate(obj):
+    for selected in list(bpy.context.selected_objects):
+        selected.select_set(False)
+    obj.hide_set(False)
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
+
+
+def _make_source(name, location):
+    bpy.ops.mesh.primitive_cube_add(size=2.0, location=location)
+    source = bpy.context.object
+    source.name = name
+    return source
+
+
 _unregister_loaded_test_copy()
 addon.register()
 
@@ -52,60 +67,138 @@ try:
     settings.wire_display = True
     settings.hide_sources = False
 
-    result = operators.generate_for_objects(
+    first_result = operators.generate_for_objects(
         bpy.context,
         [source],
         base_name=source.name,
         settings=settings,
     )
-    colliders = result["colliders"]
-    assert colliders
-    assert all(obj.display_type == "WIRE" for obj in colliders)
-    assert json.loads(colliders[0]["agr_source_objects_json"]) == [
+    first_colliders = first_result["colliders"]
+    assert first_colliders
+    assert all(obj.display_type == "WIRE" for obj in first_colliders)
+    assert json.loads(first_colliders[0]["agr_source_objects_json"]) == [
         "Facade, North"
     ]
 
-    # Changing the UI setting must update the already-generated result rather
-    # than only affecting the next generation.
-    settings.wire_display = False
-    assert all(obj.display_type == "SOLID" for obj in colliders)
-    settings.wire_display = True
-    assert all(obj.display_type == "WIRE" for obj in colliders)
+    second_source = _make_source("Annex", (4.0, 0.0, 0.0))
+    second_result = operators.generate_for_objects(
+        bpy.context,
+        [second_source],
+        base_name=second_source.name,
+        settings=settings,
+    )
+    second_colliders = second_result["colliders"]
+    assert second_colliders
+    assert all(obj.display_type == "WIRE" for obj in second_colliders)
 
-    # The visibility setting must also be reversible for the source set owned
-    # by the generated colliders.
-    settings.hide_sources = True
+    # Viewport toggles must read and change only the collision set owned by
+    # the active source. The other generated set must remain untouched.
+    _activate(source)
+    assert operators.active_wire_display(bpy.context) is True
+    assert bpy.ops.xivgate_agr_collision.toggle_wire_display() == {"FINISHED"}
+    assert all(obj.display_type == "SOLID" for obj in first_colliders)
+    assert all(obj.display_type == "WIRE" for obj in second_colliders)
+    assert not operators.active_wire_display(bpy.context)
+
+    _activate(second_source)
+    assert operators.active_wire_display(bpy.context)
+    assert settings.wire_display is False
+    settings.show_progress_console = False
+    assert bpy.ops.xivgate_agr_collision.generate() == {"FINISHED"}
+    second_colliders = operators._generated_colliders(
+        bpy.context.scene,
+        second_source.name,
+    )
+    assert all(obj.display_type == "WIRE" for obj in second_colliders)
+    assert all(obj.display_type == "SOLID" for obj in first_colliders)
+
+    _activate(source)
+    assert bpy.ops.xivgate_agr_collision.toggle_wire_display() == {"FINISHED"}
+    assert all(obj.display_type == "WIRE" for obj in first_colliders)
+    assert all(obj.display_type == "WIRE" for obj in second_colliders)
+
+    assert operators.active_sources_hidden(bpy.context) is False
+    assert bpy.ops.xivgate_agr_collision.toggle_source_visibility() == {
+        "FINISHED"
+    }
     assert source.hide_get()
-    settings.hide_sources = False
+    assert not second_source.hide_get()
+
+    # Regenerating another visible set must preserve its own source state,
+    # even though the last toggled set changed the scene-level default.
+    _activate(second_source)
+    assert settings.hide_sources is True
+    assert bpy.ops.xivgate_agr_collision.generate() == {"FINISHED"}
+    second_colliders = operators._generated_colliders(
+        bpy.context.scene,
+        second_source.name,
+    )
+    assert source.hide_get()
+    assert not second_source.hide_get()
+
+    # A generated collider resolves back to the same set, allowing a hidden
+    # source to be restored without affecting any other source.
+    _activate(first_colliders[0])
+    assert operators.active_sources_hidden(bpy.context)
+    assert bpy.ops.xivgate_agr_collision.toggle_source_visibility() == {
+        "FINISHED"
+    }
     assert not source.hide_get()
+    assert not second_source.hide_get()
+
+    for selected in list(bpy.context.selected_objects):
+        selected.select_set(False)
+    bpy.context.view_layer.objects.active = None
+    assert not bpy.ops.xivgate_agr_collision.toggle_wire_display.poll()
+    assert not bpy.ops.xivgate_agr_collision.toggle_source_visibility.poll()
 
     # Colliders from <= 1.2.6 stored one or more names as a comma-separated
     # string. A legacy object name may itself also be valid JSON syntax.
     source.name = "123"
-    for collider in colliders:
+    for collider in first_colliders:
         if "agr_source_objects_json" in collider:
             del collider["agr_source_objects_json"]
         collider["agr_source_objects"] = source.name
-    settings.hide_sources = True
+    operators.apply_source_visibility(
+        bpy.context.scene,
+        True,
+        view_layer=bpy.context.view_layer,
+        colliders=first_colliders,
+    )
     assert source.hide_get()
-    settings.hide_sources = False
+    operators.apply_source_visibility(
+        bpy.context.scene,
+        False,
+        view_layer=bpy.context.view_layer,
+        colliders=first_colliders,
+    )
     assert not source.hide_get()
 
     source.name = '["foo"]'
-    for collider in colliders:
+    for collider in first_colliders:
         collider["agr_source_objects"] = source.name
-    settings.hide_sources = True
+    operators.apply_source_visibility(
+        bpy.context.scene,
+        True,
+        view_layer=bpy.context.view_layer,
+        colliders=first_colliders,
+    )
     assert source.hide_get()
-    settings.hide_sources = False
+    operators.apply_source_visibility(
+        bpy.context.scene,
+        False,
+        view_layer=bpy.context.view_layer,
+        colliders=first_colliders,
+    )
     assert not source.hide_get()
 
     print(
         "AGR_UI_BEHAVIOR_RESULT",
         {
-            "colliders": len(colliders),
+            "colliders": len(first_colliders) + len(second_colliders),
             "selection_required": True,
-            "wire_reactive": True,
-            "source_visibility_reversible": True,
+            "active_set_isolation": True,
+            "active_collider_resolution": True,
             "legacy_source_links": True,
         },
     )

@@ -4,7 +4,9 @@
 
 import bpy
 
+from . import operators
 from . import translations
+from .core import naming
 
 
 def _configure_properties(layout):
@@ -150,8 +152,36 @@ class AGR_PT_collider_advanced(bpy.types.Panel):
         display = layout.box()
         display.label(text="Viewport Output", icon="HIDE_OFF")
         display.prop(settings, "show_progress_console")
-        display.prop(settings, "wire_display")
-        display.prop(settings, "hide_sources")
+        _base, colliders = operators.active_collision_set(context)
+        if colliders:
+            wire_display = operators.active_wire_display(context)
+            display.operator(
+                "xivgate_agr_collision.toggle_wire_display",
+                text="Wire Display",
+                icon=(
+                    "CHECKBOX_HLT" if wire_display else "CHECKBOX_DEHLT"
+                ),
+                depress=wire_display,
+            )
+            sources_hidden = operators.active_sources_hidden(context)
+            display.operator(
+                "xivgate_agr_collision.toggle_source_visibility",
+                text="Hide Sources After Generation",
+                icon=(
+                    "CHECKBOX_HLT" if sources_hidden else "CHECKBOX_DEHLT"
+                ),
+                depress=sources_hidden,
+            )
+        else:
+            active = context.view_layer.objects.active
+            defaults = display.column()
+            defaults.enabled = bool(
+                active
+                and active.type == "MESH"
+                and not naming.is_any_collider(active)
+            )
+            defaults.prop(settings, "wire_display")
+            defaults.prop(settings, "hide_sources")
 
         cleanup = layout.box()
         cleanup.label(text="Manual Cleanup", icon="TRASH")
