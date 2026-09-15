@@ -371,8 +371,36 @@ def _candidate_planes(piece, rng, tolerance):
                     canonical_normal,
                 )
         ordered = [candidates[key] for key in sorted(candidates)]
-        rng.shuffle(ordered)
-        return ordered
+        if len(ordered) <= 32:
+            rng.shuffle(ordered)
+            return ordered
+
+        reflex_verts = np.asarray([
+            tuple(v.co) for v in bm.verts
+            if any(e.calc_face_angle_signed() < -CONCAVE_EPSILON for e in v.link_edges)
+        ], dtype=np.float64)
+
+        if len(reflex_verts) == 0:
+            rng.shuffle(ordered)
+            return ordered[:32]
+
+        scored = []
+        for pt, no in ordered:
+            dists = (reflex_verts - pt) @ no
+            near = np.sum(np.abs(dists) < max(tolerance, 0.05))
+            pos = np.sum(dists > tolerance)
+            neg = np.sum(dists < -tolerance)
+            balance = min(pos, neg) / max(len(reflex_verts), 1)
+            score = near * 2.0 + balance * 10.0
+            scored.append((score, (pt, no)))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [p for _, p in scored[:24]]
+        rest = [p for _, p in scored[24:]]
+        rng.shuffle(rest)
+        selected = top + rest[:8]
+        rng.shuffle(selected)
+        return selected
     finally:
         bm.free()
 
@@ -1253,9 +1281,15 @@ def _inset_convex_piece(piece, distance):
     can shorten a 55 m prism by several centimetres.  Reconstructing the
     polyhedron from the shifted half-spaces keeps the clearance independent of
     aspect ratio and preserves the ends of tall architectural collision parts.
+    For polyhedra with shallow dihedral angles (such as curved cuts or arches),
+    half-space intersections are ill-conditioned; vertex-normal contraction is
+    used instead to avoid cutting off arched contours.
     """
     if distance <= 0.0:
         return piece
+    if len(piece.vertices) < 4:
+        return piece
+
     planes = _convex_planes(piece)
     if len(planes) < 4:
         return piece
@@ -1264,59 +1298,90 @@ def _inset_convex_piece(piece, distance):
         [normal for _point, normal in planes],
         dtype=np.float64,
     )
-    offsets = np.asarray(
-        [float(np.dot(point, normal)) - distance for point, normal in planes],
-        dtype=np.float64,
-    )
-    epsilon = max(distance * 1.0e-5, 1.0e-9)
-    intersections = []
-    for left in range(len(planes) - 2):
-        for middle in range(left + 1, len(planes) - 1):
-            for right in range(middle + 1, len(planes)):
-                matrix = normals[[left, middle, right]]
-                determinant = float(np.linalg.det(matrix))
-                if abs(determinant) <= 1.0e-10:
-                    continue
-                point = np.linalg.solve(
-                    matrix,
-                    offsets[[left, middle, right]],
-                )
-                if np.all(normals @ point <= offsets + epsilon):
-                    intersections.append(point)
+    dots = normals @ normals.T
+    np.fill_diagonal(dots, -1.0)
+    max_dot = float(dots.max())
 
-    if len(intersections) < 4:
-        # The requested clearance consumed this sliver completely. Returning
-        # the pre-inset piece would reintroduce the exact zero-volume fragment
-        # the clearance operation was meant to eliminate.
-        return _analyse_piece(Piece(
-            vertices=np.empty((0, 3), dtype=np.float64),
-            faces=np.empty((0, 3), dtype=np.int32),
-            depth=piece.depth,
-        ))
-    hull = _convex_hull(np.asarray(intersections, dtype=np.float64))
-    if hull is None:
-        return _analyse_piece(Piece(
-            vertices=np.empty((0, 3), dtype=np.float64),
-            faces=np.empty((0, 3), dtype=np.int32),
-            depth=piece.depth,
-        ))
-    return _analyse_piece(
-        Piece(
-            vertices=hull[0],
-            faces=hull[1],
-            depth=piece.depth,
-            approximate_open_shell=piece.approximate_open_shell,
-            allow_tolerance_hull=piece.allow_tolerance_hull,
-            approximation_deviation=max(
-                piece.approximation_deviation,
-                distance,
-            ),
+    if len(planes) <= 16 and max_dot <= 0.85:
+        offsets = np.asarray(
+            [float(np.dot(point, normal)) - distance for point, normal in planes],
+            dtype=np.float64,
         )
-    )
+        intersections = []
+        base_eps = max(distance * 1.0e-5, 1.0e-9)
+        for eps in (base_eps, 1.0e-6, 1.0e-5):
+            intersections = []
+            for left in range(len(planes) - 2):
+                for middle in range(left + 1, len(planes) - 1):
+                    for right in range(middle + 1, len(planes)):
+                        matrix = normals[[left, middle, right]]
+                        if abs(float(np.linalg.det(matrix))) <= 1.0e-6:
+                            continue
+                        point = np.linalg.solve(
+                            matrix,
+                            offsets[[left, middle, right]],
+                        )
+                        if np.all(normals @ point <= offsets + eps):
+                            intersections.append(point)
+            if len(intersections) >= 4:
+                break
+
+        if len(intersections) >= 4:
+            hull = _convex_hull(np.asarray(intersections, dtype=np.float64))
+            if hull is not None:
+                return _analyse_piece(
+                    Piece(
+                        vertices=hull[0],
+                        faces=hull[1],
+                        depth=piece.depth,
+                        approximate_open_shell=piece.approximate_open_shell,
+                        allow_tolerance_hull=piece.allow_tolerance_hull,
+                        approximation_deviation=max(
+                            piece.approximation_deviation,
+                            distance,
+                        ),
+                    )
+                )
+
+    bm = _new_bmesh(piece.vertices, piece.faces)
+    try:
+        new_verts = [
+            np.asarray(tuple(v.co - v.normal * distance), dtype=np.float64)
+            for v in bm.verts
+        ]
+    finally:
+        bm.free()
+    hull = _convex_hull(np.asarray(new_verts, dtype=np.float64))
+    if hull is not None:
+        return _analyse_piece(
+            Piece(
+                vertices=hull[0],
+                faces=hull[1],
+                depth=piece.depth,
+                approximate_open_shell=piece.approximate_open_shell,
+                allow_tolerance_hull=piece.allow_tolerance_hull,
+                approximation_deviation=max(
+                    piece.approximation_deviation,
+                    distance,
+                ),
+            )
+        )
+
+    return _analyse_piece(Piece(
+        vertices=np.empty((0, 3), dtype=np.float64),
+        faces=np.empty((0, 3), dtype=np.int32),
+        depth=piece.depth,
+    ))
 
 
 def _pieces_overlap(subject, cutter, clearance=1.0e-6):
     """Return true only for positive-volume overlap, not shared boundaries."""
+    s_min = subject.vertices.min(axis=0)
+    s_max = subject.vertices.max(axis=0)
+    c_min = cutter.vertices.min(axis=0)
+    c_max = cutter.vertices.max(axis=0)
+    if np.any(s_max < c_min + clearance) or np.any(c_max < s_min + clearance):
+        return False
     cutter_planes = _convex_planes(cutter)
     subject_planes = _convex_planes(subject)
     return (
@@ -1554,7 +1619,7 @@ def _source_coverage_deviation(
     tolerance=0.0,
     sample_limit=25000,
 ):
-    """Measure source-surface samples against convex output half-spaces."""
+    """Measure source-surface samples against convex output colliders."""
     if not convex_pieces:
         return math.inf, 0
 
@@ -1569,42 +1634,54 @@ def _source_coverage_deviation(
         )
         samples = samples[indices]
 
+    piece_bvhs = []
+    piece_bounds = []
     piece_planes = []
     for piece in convex_pieces:
         planes = _convex_planes(piece)
-        if not planes:
-            continue
-        plane_points = np.asarray(
-            [plane_point for plane_point, _ in planes],
-            dtype=np.float64,
-        )
-        plane_normals = np.asarray(
-            [plane_normal for _, plane_normal in planes],
-            dtype=np.float64,
-        )
-        piece_planes.append((plane_points, plane_normals))
+        piece_planes.append(planes)
+        pts = [Vector(tuple(p)) for p in piece.vertices]
+        faces = [tuple(int(i) for i in f) for f in piece.faces]
+        bvh = BVHTree.FromPolygons(pts, faces, all_triangles=True)
+        piece_bvhs.append(bvh)
+        piece_bounds.append((piece.vertices.min(axis=0), piece.vertices.max(axis=0)))
 
     worst = 0.0
     uncovered = 0
+    tol = float(tolerance)
     for point in samples:
-        nearest_violation = math.inf
-        for plane_points, plane_normals in piece_planes:
-            violation = float(
-                np.max(
-                    np.einsum(
-                        "ij,ij->i",
-                        point - plane_points,
-                        plane_normals,
-                    )
-                )
-            )
-            nearest_violation = min(nearest_violation, violation)
-            if nearest_violation <= 0.0:
+        # Quick check: is the point inside any convex piece?
+        inside = False
+        for idx, (p_min, p_max) in enumerate(piece_bounds):
+            if np.any(point < p_min - 1.0e-6) or np.any(point > p_max + 1.0e-6):
+                continue
+            if _point_inside_convex(point, piece_planes[idx], epsilon=1.0e-6):
+                inside = True
                 break
-        if nearest_violation > tolerance:
-            uncovered += 1
-        if nearest_violation > 0.0:
-            worst = max(worst, nearest_violation)
+        if inside:
+            continue
+
+        # Point is outside all pieces: measure Euclidean distance to nearest surface
+        pt_vec = Vector(tuple(point))
+        nearest_dist = math.inf
+        for idx, (p_min, p_max) in enumerate(piece_bounds):
+            if np.any(point < p_min - tol) or np.any(point > p_max + tol):
+                continue
+            hit = piece_bvhs[idx].find_nearest(pt_vec)
+            if hit[0] is not None:
+                d = float(hit[3])
+                if d < nearest_dist:
+                    nearest_dist = d
+                    if nearest_dist <= 1.0e-6:
+                        break
+        if nearest_dist > tol:
+            if nearest_dist == math.inf:
+                nearest_dist = min(bvh.find_nearest(pt_vec)[3] for bvh in piece_bvhs)
+            if nearest_dist > tol:
+                uncovered += 1
+        if nearest_dist > 0.0 and nearest_dist != math.inf:
+            worst = max(worst, nearest_dist)
+
     return worst, uncovered
 
 
