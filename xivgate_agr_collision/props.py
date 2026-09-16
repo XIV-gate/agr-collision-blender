@@ -69,8 +69,11 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
     )
     gap: FloatProperty(
         name="Gap",
-        description="Air gap between neighbouring hulls; 0.0002 m is the AGR minimum",
-        default=0.0002,
+        description=(
+            "Air gap between neighbouring hulls; AGR recommends 0.2-10 mm, and "
+            "1 mm clears SINTEZ AGR Checker at any gap tolerance it allows"
+        ),
+        default=0.001,
         min=0.0002,
         max=0.01,
         precision=4,

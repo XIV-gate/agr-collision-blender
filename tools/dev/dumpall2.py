@@ -5,7 +5,7 @@ sys.path.insert(0, argv[0])
 from xivgate_agr_collision.core import decompose as D
 d = np.load(argv[1])
 t = time.time()
-r = D.decompose(SimpleNamespace(vertices=d["v"], faces=d["f"]), SimpleNamespace(gap=0.0002, thin_threshold=0.05, attempts=int(argv[3]) if len(argv) > 3 else 1))
+r = D.decompose(SimpleNamespace(vertices=d["v"], faces=d["f"]), SimpleNamespace(gap=float(argv[4]) if len(argv) > 4 else 0.001, thin_threshold=0.05, attempts=int(argv[3]) if len(argv) > 3 else 1))
 print("TIME %.1fs complete %s hulls %d tris %d maxdev %.3f tol %.3f" % (time.time()-t, r.complete, len(r.hulls), r.total_triangles, r.max_deviation, r.feature_tolerance))
 for w in r.warnings: print("WARN", w)
 def save(path, items):

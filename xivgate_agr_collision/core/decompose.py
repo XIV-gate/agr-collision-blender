@@ -10,12 +10,15 @@
 # Only parts thinner than the thin-part threshold are ignored.
 
 from dataclasses import dataclass, field
+import itertools
 import math
 
 import bmesh
 import numpy as np
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
+
+from . import hull64
 
 
 MAX_PARTS = 999
@@ -59,6 +62,12 @@ SEARCH_MAX_SKIP = 24
 SEARCH_WORK_SHARE = 0.25
 # Real variants such a node may try before it is retired.
 SEARCH_HEAVY_VARIANTS = 1
+# Output hulls merge hull triangles into one planar polygon when their
+# corners lie this close to a common plane.
+OUTPUT_MERGE_DISTANCE = 1.0e-5
+# Up to this many face planes the gap inset intersects every plane triple;
+# above it only planes of neighbouring faces.
+INSET_GLOBAL_PLANES = 48
 # Automatic depth tolerance for shallow steps, as a share of the thin-part
 # threshold: 0.4 of 5 cm lets a hull bridge steps and recesses up to 2 cm.
 FEATURE_TOLERANCE_RATIO = 0.4
@@ -96,6 +105,9 @@ class DecompositionResult:
     ignored_parts: list = field(default_factory=list)
     failed_parts: list = field(default_factory=list)
     feature_tolerance: float = 0.0
+    # Planar polygon faces of each hull, as vertex index lists, in the order
+    # of ``hulls``; the triangles in ``hulls`` are their fans.
+    polygons: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -2129,6 +2141,229 @@ def _reliable_hull_planes(vertices, faces):
     return planes, incident
 
 
+def _polytope_piece(vertices, depth=0):
+    """Exact convex polytope of the points, with planar polygon faces.
+
+    The piece keeps fan triangles in ``faces`` for everything that measures
+    it, and the polygons themselves in ``polygons`` for the output mesh.
+    """
+    result = hull64.planar_polytope(vertices, OUTPUT_MERGE_DISTANCE)
+    if result is None:
+        return None
+    points, polygons = result
+    faces = hull64.fan_triangles(polygons).astype(np.int32)
+    piece = Piece(vertices=points, faces=faces, depth=depth)
+    piece.polygons = polygons
+    piece.closed = True
+    piece.volume = abs(_signed_volume(points, faces))
+    return piece
+
+
+def _polytope_planes(piece):
+    """Outward unit normals and supporting offsets of a polytope's polygons."""
+    vertices = piece.vertices
+    normals = []
+    for polygon in piece.polygons:
+        points = vertices[polygon]
+        following = np.roll(points, -1, axis=0)
+        normal = np.array([
+            np.sum((points[:, 1] - following[:, 1]) * (points[:, 2] + following[:, 2])),
+            np.sum((points[:, 2] - following[:, 2]) * (points[:, 0] + following[:, 0])),
+            np.sum((points[:, 0] - following[:, 0]) * (points[:, 1] + following[:, 1])),
+        ])
+        length = float(np.linalg.norm(normal))
+        if length > 0.0:
+            normals.append(normal / length)
+    normals = np.asarray(normals).reshape((-1, 3))
+    # Supporting offsets: every vertex lies behind every plane by construction.
+    offsets = (vertices @ normals.T).max(axis=0) if len(normals) else np.empty(0)
+    return normals, offsets
+
+
+def _inset_polytope(piece, distance):
+    """Shift every face plane of a convex polytope inward by ``distance``.
+
+    The result is the intersection of the shifted half-spaces, rebuilt from
+    their exact vertices. Every point of it lies at least ``distance`` inside
+    the original, so two pieces that did not overlap end at least twice that
+    distance apart - the gap SINTEZ AGR Checker measures is then guaranteed
+    rather than approximately reached. Returns an empty piece when the shift
+    swallows the whole polytope.
+    """
+    empty = Piece(
+        vertices=np.empty((0, 3), dtype=np.float64),
+        faces=np.empty((0, 3), dtype=np.int32),
+        depth=piece.depth,
+    )
+    if distance <= 0.0:
+        return piece
+    if getattr(piece, "polygons", None) is None:
+        rebuilt = _polytope_piece(piece.vertices, piece.depth)
+        if rebuilt is None:
+            return empty
+        piece = rebuilt
+    normals, offsets = _polytope_planes(piece)
+    if len(normals) < 4:
+        return empty
+    shifted = offsets - distance
+    scale = max(float(np.abs(piece.vertices).max()), 1.0)
+    count = len(normals)
+    if count <= INSET_GLOBAL_PLANES:
+        triples = np.asarray(list(itertools.combinations(range(count), 3)), dtype=np.int64)
+    else:
+        # Only planes near each other can meet in a vertex of the inset:
+        # those of the polygons around a vertex and of their neighbours.
+        vertex_polygons = {}
+        for index, polygon in enumerate(piece.polygons):
+            for vertex in polygon:
+                vertex_polygons.setdefault(vertex, set()).add(index)
+        neighbourhood = {}
+        for vertex, owners in vertex_polygons.items():
+            ring = set(owners)
+            for owner in owners:
+                for corner in piece.polygons[owner]:
+                    ring |= vertex_polygons[corner]
+            neighbourhood[vertex] = sorted(ring)
+        rows = set()
+        for ring in neighbourhood.values():
+            rows.update(itertools.combinations(ring, 3))
+        triples = np.asarray(sorted(rows), dtype=np.int64).reshape((-1, 3))
+    if len(triples) == 0:
+        return empty
+    matrices = normals[triples]
+    determinants = np.linalg.det(matrices)
+    usable = np.abs(determinants) > 1.0e-10
+    if not usable.any():
+        return empty
+    points = np.linalg.solve(matrices[usable], shifted[triples[usable]][..., None])[..., 0]
+    inside = np.all(points @ normals.T - shifted <= scale * 1.0e-12, axis=1)
+    points = points[inside]
+    if len(points) < 4:
+        return empty
+    rebuilt = _polytope_piece(points, piece.depth)
+    return rebuilt if rebuilt is not None else empty
+
+
+def _polytope_edges(piece):
+    pairs = {
+        (min(polygon[k], polygon[(k + 1) % len(polygon)]),
+         max(polygon[k], polygon[(k + 1) % len(polygon)]))
+        for polygon in piece.polygons
+        for k in range(len(polygon))
+    }
+    return np.asarray(sorted(pairs), dtype=np.int64).reshape((-1, 2))
+
+
+def _clip_polytope(piece, normal, offset):
+    """Keep the part of a convex polytope with ``normal . x <= offset``.
+
+    The clipped polytope's corners are the kept corners plus the points where
+    edges cross the plane, so the result is exact.
+    """
+    empty = Piece(
+        vertices=np.empty((0, 3), dtype=np.float64),
+        faces=np.empty((0, 3), dtype=np.int32),
+        depth=piece.depth,
+    )
+    vertices = piece.vertices
+    distance = vertices @ normal - offset
+    if bool((distance <= 0.0).all()):
+        return piece
+    if bool((distance >= 0.0).all()):
+        return empty
+    edges = _polytope_edges(piece)
+    start, end = distance[edges[:, 0]], distance[edges[:, 1]]
+    crossing = (start < 0.0) != (end < 0.0)
+    a, b = edges[crossing, 0], edges[crossing, 1]
+    fraction = (distance[a] / (distance[a] - distance[b]))[:, None]
+    points = np.vstack((vertices[distance <= 0.0], vertices[a] + (vertices[b] - vertices[a]) * fraction))
+    rebuilt = _polytope_piece(points, piece.depth) if len(points) >= 4 else None
+    return rebuilt if rebuilt is not None else empty
+
+
+def _vertex_surface_gap(first, second):
+    """Smallest distance from a corner of either polytope to the other one.
+
+    SINTEZ AGR Checker measures the gap exactly this way - from each vertex
+    to the nearest point of the other hull - so this is what has to clear
+    the gap setting.
+    """
+    gaps = []
+    for points, other in ((first.vertices, second), (second.vertices, first)):
+        triangles = other.faces
+        gaps.append(float(hull64.distance_to_triangles(
+            points,
+            other.vertices[triangles[:, 0]],
+            other.vertices[triangles[:, 1]],
+            other.vertices[triangles[:, 2]],
+        ).min()))
+    return min(gaps)
+
+
+def _overlapping(first, second):
+    """True when two convex polytopes share interior (separating axis test)."""
+    axes = [_polytope_planes(first)[0], _polytope_planes(second)[0]]
+    edges_first = _polytope_edges(first)
+    edges_second = _polytope_edges(second)
+    if len(edges_first) and len(edges_second):
+        u = first.vertices[edges_first[:, 1]] - first.vertices[edges_first[:, 0]]
+        v = second.vertices[edges_second[:, 1]] - second.vertices[edges_second[:, 0]]
+        crosses = np.cross(u[:, None, :], v[None, :, :]).reshape((-1, 3))
+        lengths = np.linalg.norm(crosses, axis=1)
+        keep = lengths > 1.0e-12
+        axes.append(crosses[keep] / lengths[keep, None])
+    axes = np.vstack([block for block in axes if len(block)])
+    first_projection = first.vertices @ axes.T
+    second_projection = second.vertices @ axes.T
+    separation = np.maximum(
+        second_projection.min(axis=0) - first_projection.max(axis=0),
+        first_projection.min(axis=0) - second_projection.max(axis=0),
+    )
+    return bool(separation.max() <= 0.0)
+
+
+def _separate_polytopes(pieces, gap):
+    """Make every pair of polytopes clear ``gap`` the way the checker measures.
+
+    The exact inset already guarantees the gap between pieces that did not
+    overlap before it; pieces that did are resolved here. The smaller piece
+    of such a pair is clipped by a plane ``gap`` away from the larger one,
+    along the axis that needs the thinnest slice. Clipping only ever shrinks
+    a piece, so resolving one pair cannot break another, and one pass over
+    the pairs is enough.
+    """
+    pieces = list(pieces)
+    lower = [piece.vertices.min(axis=0) for piece in pieces]
+    upper = [piece.vertices.max(axis=0) for piece in pieces]
+    for index in range(len(pieces)):
+        for other in range(index + 1, len(pieces)):
+            first, second = pieces[index], pieces[other]
+            if len(first.faces) == 0 or len(second.faces) == 0:
+                continue
+            if np.any(upper[index] + gap < lower[other]) or np.any(upper[other] + gap < lower[index]):
+                continue
+            if not _overlapping(first, second) and _vertex_surface_gap(first, second) >= gap:
+                continue
+            small, large = (index, other) if abs(first.volume) <= abs(second.volume) else (other, index)
+            clipped = pieces[small]
+            fixed = pieces[large]
+            direction = fixed.vertices.mean(axis=0) - clipped.vertices.mean(axis=0)
+            axes = [_polytope_planes(clipped)[0], _polytope_planes(fixed)[0]]
+            if float(np.linalg.norm(direction)) > 0.0:
+                axes.append((direction / np.linalg.norm(direction))[None, :])
+            axes = np.vstack([block for block in axes if len(block)])
+            # Orient every axis from the clipped piece towards the fixed one.
+            axes = axes * np.where(axes @ direction < 0.0, -1.0, 1.0)[:, None]
+            limit = (fixed.vertices @ axes.T).min(axis=0) - gap
+            slice_depth = (clipped.vertices @ axes.T).max(axis=0) - limit
+            best = int(np.argmin(slice_depth))
+            pieces[small] = _clip_polytope(clipped, axes[best], float(limit[best]))
+            if len(pieces[small].faces):
+                lower[small] = pieces[small].vertices.min(axis=0)
+                upper[small] = pieces[small].vertices.max(axis=0)
+    return pieces
+
+
 def _inset_convex_piece(piece, distance):
     """Move every support plane of a convex piece inward by one distance.
 
@@ -2662,15 +2897,22 @@ def _decompose_with_tolerance(source, settings, seed, thin_limit, tolerance):
                 )
             )
 
+    # Exact polytopes before the gap: the float32 hulls the cutting stages
+    # build are convex only to a fraction of a millimetre, and shifting their
+    # planes would carry that error into the gap.
+    kept = [
+        _polytope_piece(piece.vertices, piece.depth) or piece for piece in kept
+    ]
     hulls_before_gap = kept
-    kept = [_inset_convex_piece(piece, gap * 0.5 + 1.0e-7) for piece in kept]
+    kept = [_inset_polytope(piece, gap * 0.5 + 1.0e-7) for piece in kept]
     kept = [
         piece for piece in kept
         if len(piece.faces) and not _is_ignorable_fragment(piece, settings)
     ]
-    # Float32 export rounds hull vertices; clip the last sub-millimetre
-    # contacts so the exported UCX set never reports an intersection.
-    kept = _separate_touching_pieces(kept, limit=tolerance)
+    # Pieces that overlapped before the inset still overlap or sit closer
+    # than the gap; clip them apart exactly, the way SINTEZ AGR Checker
+    # measures intersections and gaps.
+    kept = _separate_polytopes(kept, gap)
     kept = [
         piece for piece in kept
         if len(piece.faces) and not _is_ignorable_fragment(piece, settings)
@@ -2698,9 +2940,19 @@ def _decompose_with_tolerance(source, settings, seed, thin_limit, tolerance):
             )
         )
 
-    hulls = [(piece.vertices, piece.faces) for piece in kept]
+    # The output is rebuilt as exact polytopes with planar faces: separating
+    # touching pieces cuts them again with triangulated caps, and needle
+    # triangles are exactly what makes SINTEZ AGR Checker report a convex
+    # hull as concave.
+    output = []
+    for piece in kept:
+        polytope = _polytope_piece(piece.vertices, piece.depth)
+        if polytope is not None:
+            output.append(polytope)
+    hulls = [(piece.vertices, piece.faces) for piece in output]
     return DecompositionResult(
         hulls=hulls,
+        polygons=[piece.polygons for piece in output],
         max_deviation=tolerance,
         total_triangles=sum(len(faces) for _, faces in hulls),
         seed=seed,

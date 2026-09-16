@@ -153,6 +153,125 @@ def convex_hull(points):
     ).reshape((-1, 3))
 
 
+def planar_polytope(points, merge_distance):
+    """Convex hull of ``points`` as planar polygons instead of triangles.
+
+    Returns ``(vertices, polygons)`` with only the vertices the polygons use,
+    or ``None`` when the points span no volume.
+
+    A triangulated hull is full of long needle triangles whose plane is
+    decided by micrometres of rounding. SINTEZ AGR Checker judges convexity
+    against every face plane, and on the reference tower such needles made
+    five hulls with a true concavity of 0.03-0.33 mm fail its 10 mm check,
+    because a vertex ten metres away swings across a tilted needle. Here the
+    triangles of one plane are merged into a single polygon, whose normal is
+    taken over all its corners and is stable.
+
+    Triangles join a facet when all their corners lie within
+    ``merge_distance`` of the facet's seed plane, seeded from the largest
+    triangles first. A corner shared by only two facets is not a corner of
+    the polytope at all, only a point on the edge between them, and is
+    dropped from both.
+    """
+    points = np.asarray(points, dtype=np.float64).reshape((-1, 3))
+    triangles = convex_hull(points)
+    if len(triangles) == 0:
+        return None
+    corners = points[triangles]
+    normals = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+    areas = 0.5 * np.linalg.norm(normals, axis=1)
+    units = np.divide(
+        normals, (2.0 * areas)[:, None], out=np.zeros_like(normals), where=areas[:, None] > 0.0
+    )
+    edge_triangle = {}
+    for index, (a, b, c) in enumerate(triangles.tolist()):
+        for edge in ((a, b), (b, c), (c, a)):
+            edge_triangle[edge] = index
+
+    facet_of = np.full(len(triangles), -1, dtype=np.int64)
+    facets = []
+    for seed in np.argsort(-areas, kind="stable").tolist():
+        if facet_of[seed] >= 0:
+            continue
+        unit = units[seed]
+        offset = float(unit @ corners[seed, 0])
+        members = [seed]
+        facet_of[seed] = len(facets)
+        stack = [seed]
+        while stack:
+            current = stack.pop()
+            a, b, c = triangles[current].tolist()
+            for u, v in ((a, b), (b, c), (c, a)):
+                neighbour = edge_triangle.get((v, u))
+                if neighbour is None or facet_of[neighbour] >= 0:
+                    continue
+                if float(units[neighbour] @ unit) <= 0.0:
+                    continue
+                if float(np.abs(corners[neighbour] @ unit - offset).max()) > merge_distance:
+                    continue
+                facet_of[neighbour] = len(facets)
+                members.append(neighbour)
+                stack.append(neighbour)
+        facets.append(members)
+
+    polygons = []
+    for members in facets:
+        member_set = set(members)
+        following = {}
+        valid = True
+        for index in members:
+            a, b, c = triangles[index].tolist()
+            for u, v in ((a, b), (b, c), (c, a)):
+                if facet_of[edge_triangle[(v, u)]] == facet_of[index]:
+                    continue
+                if u in following:
+                    valid = False
+                following[u] = v
+        loop = []
+        if valid and following:
+            start = next(iter(following))
+            current = start
+            while True:
+                loop.append(current)
+                current = following.get(current)
+                if current is None or len(loop) > len(following):
+                    valid = False
+                    break
+                if current == start:
+                    break
+            valid = valid and len(loop) == len(following)
+        if valid and len(loop) >= 3:
+            polygons.append(loop)
+        else:
+            # A facet whose outline is not one simple loop is left as its
+            # triangles rather than guessed at.
+            polygons.extend(triangles[index].tolist() for index in sorted(member_set))
+
+    incidence = {}
+    for polygon in polygons:
+        for vertex in polygon:
+            incidence[vertex] = incidence.get(vertex, 0) + 1
+    polygons = [
+        [vertex for vertex in polygon if incidence[vertex] >= 3]
+        for polygon in polygons
+    ]
+    polygons = [polygon for polygon in polygons if len(polygon) >= 3]
+
+    used = sorted({vertex for polygon in polygons for vertex in polygon})
+    remap = {old: new for new, old in enumerate(used)}
+    return points[used], [[remap[vertex] for vertex in polygon] for polygon in polygons]
+
+
+def fan_triangles(polygons):
+    """Triangles of convex polygons, as an (N, 3) index array."""
+    rows = [
+        (polygon[0], polygon[corner], polygon[corner + 1])
+        for polygon in polygons
+        for corner in range(1, len(polygon) - 1)
+    ]
+    return np.asarray(rows, dtype=np.int64).reshape((-1, 3))
+
+
 def hull_edges(triangles):
     """Unique undirected edges of a triangle list."""
     if len(triangles) == 0:

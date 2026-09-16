@@ -134,12 +134,26 @@ icons = set(bpy.types.UILayout.bl_rna.functions["label"].parameters["icon"].enum
 for icon in ("OUTLINER_COLLECTION", "MOD_SMOOTH", "SNAP_VOLUME", "MOD_SOLIDIFY", "RESTRICT_SELECT_OFF"):
     assert icon in icons, icon
 
+pair = bpy.data.collections.new("DBG_PAIR")
+scene.collection.children.link(pair)
+mesh_object("UCX_Pair_001", cube(), pair, (0.0, 0.0, 0.0))
+mesh_object("UCX_Pair_002", cube(), pair, (0.5, 0.0, 0.0))
+mesh_object("UCX_Pair_003", cube(), pair, (5.0, 0.0, 0.0))
+bpy.context.view_layer.update()
+settings.debug_collection = pair
+assert bpy.ops.xivgate_agr_collision.debug_agr_checker() == {"FINISHED"}
+assert selected_names() == {"UCX_Pair_001", "UCX_Pair_002"}, selected_names()
+checker_status = settings.debug_status
+assert "intersecting" in checker_status, checker_status
+
 bpy.ops.mesh.primitive_cube_add(size=2.0, location=(10.0, 20.0, 3.0))
 source = bpy.context.object
 source.name = "SM_DebugSource"
 generated = operators.generate_for_objects(bpy.context, [source], base_name=source.name)
 assert settings.debug_collection == generated["collection"]
 assert bpy.ops.xivgate_agr_collision.debug_concave() == {"FINISHED"}
+assert not selected_names(), selected_names()
+assert bpy.ops.xivgate_agr_collision.debug_agr_checker() == {"FINISHED"}
 assert not selected_names(), selected_names()
 
 print(

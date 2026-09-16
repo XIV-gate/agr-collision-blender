@@ -308,7 +308,13 @@ def _create_collider_collection(
                     float(vertex[2]) - pivot.z,
                 )
                 for vertex in vertices
-            ], [], faces.tolist())
+            ], [], (
+                # Planar polygons rather than their fan triangles: needle
+                # triangles make SINTEZ AGR Checker read a convex hull as
+                # concave.
+                result.polygons[index - 1]
+                if len(result.polygons) >= index else faces.tolist()
+            ))
             mesh.materials.clear()
             mesh.update(calc_edges=True)
 
@@ -423,11 +429,12 @@ def generate_for_objects(
         origin_world=pivot,
     )
     try:
-        progress(88, "Validating convexity, closure, intersections and names")
+        progress(88, "Validating convexity, closure, intersections, gaps and names")
         report = validation.validate_colliders(
             colliders,
             expected_base=source_data.name,
             triangle_budget=budget,
+            checker_tolerances=validation.agr_checker_tolerances(context.scene),
         )
         if not report.valid:
             raise RuntimeError(report.errors[0])
@@ -666,6 +673,7 @@ class AGR_OT_validate(bpy.types.Operator):
             colliders,
             expected_base=base,
             triangle_budget=budget,
+            checker_tolerances=validation.agr_checker_tolerances(context.scene),
         )
         settings.last_colliders = report.collider_count
         settings.last_triangles = report.triangle_count
@@ -876,6 +884,39 @@ class AGR_OT_debug_thin(_DebugOperator, bpy.types.Operator):
         })
 
 
+class AGR_OT_debug_agr_checker(_DebugOperator, bpy.types.Operator):
+    bl_idname = "xivgate_agr_collision.debug_agr_checker"
+    bl_label = "Select SINTEZ Checker Failures"
+    bl_description = (
+        "Select objects SINTEZ AGR Checker would reject: open, non-manifold or "
+        "non-convex by its face-plane rule, intersecting, or closer than its "
+        "gap tolerance; its own tolerances are used when it is installed"
+    )
+
+    def execute(self, context):
+        settings = context.scene.xivgate_agr_collision
+        targets = debug_targets(settings)
+        convex_tolerance, gap_tolerance = validation.agr_checker_tolerances(context.scene)
+        report = validation.agr_checker_report(targets, convex_tolerance, gap_tolerance)
+        by_name = {ob.name: ob for ob in targets}
+        found = [(by_name[name], 0.0) for name in report.failing_names]
+        status = self.finish(context, found, len(targets), {
+            "none": translations.iface("SINTEZ checker passes all {}"),
+            "found": translations.iface("SINTEZ checker rejects {} of {}; first {}{}"),
+            "value": lambda _value: "",
+        })
+        if found:
+            settings.debug_status = "{} - {}".format(
+                translations.iface("SINTEZ checker rejects {} of {}").format(
+                    len(found), len(targets)
+                ),
+                report.summary(),
+            )
+            print("AGR debugger: SINTEZ rules at convexity {:.1f} mm, gap {:.1f} mm: {}".format(
+                convex_tolerance * 1000.0, gap_tolerance * 1000.0, report.summary()))
+        return status
+
+
 CLASSES = (
     AGR_OT_analyze_selected,
     AGR_OT_generate,
@@ -886,6 +927,7 @@ CLASSES = (
     AGR_OT_debug_concave,
     AGR_OT_debug_small,
     AGR_OT_debug_thin,
+    AGR_OT_debug_agr_checker,
 )
 
 

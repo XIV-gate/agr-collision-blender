@@ -39,7 +39,9 @@ def _bvh_from_object(ob):
     return BVHTree.FromPolygons(vertices, polygons, all_triangles=True, epsilon=1.0e-7)
 
 
-def validate_colliders(colliders, expected_base=None, triangle_budget=None):
+def validate_colliders(
+    colliders, expected_base=None, triangle_budget=None, checker_tolerances=None
+):
     errors = []
     warnings = []
     total_triangles = 0
@@ -141,6 +143,20 @@ def validate_colliders(colliders, expected_base=None, triangle_budget=None):
             )
         )
 
+    if checker_tolerances is not None:
+        convex_tolerance, gap_tolerance = checker_tolerances
+        checker = agr_checker_report(colliders, convex_tolerance, gap_tolerance)
+        if not checker.passed:
+            errors.append(
+                "SINTEZ AGR Checker would reject the set: {} (convexity {:.1f} mm, "
+                "gap {:.1f} mm); first: {}".format(
+                    checker.summary(),
+                    convex_tolerance * 1000.0,
+                    gap_tolerance * 1000.0,
+                    ", ".join(checker.failing_names[:3]),
+                )
+            )
+
     return ValidationReport(
         valid=not errors,
         collider_count=len(colliders),
@@ -148,6 +164,193 @@ def validate_colliders(colliders, expected_base=None, triangle_budget=None):
         errors=errors,
         warnings=warnings,
     )
+
+
+# SINTEZ AGR Checker defaults, in metres. Its scene settings hold them in mm.
+AGR_CHECKER_CONVEX_TOLERANCE = 0.01
+AGR_CHECKER_GAP_TOLERANCE = 0.0002
+
+
+@dataclass
+class AgrCheckerReport:
+    open: list[str] = field(default_factory=list)
+    non_manifold: list[str] = field(default_factory=list)
+    non_convex: list[str] = field(default_factory=list)
+    intersections: list[tuple[str, str]] = field(default_factory=list)
+    gaps: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def passed(self):
+        return not (
+            self.open or self.non_manifold or self.non_convex
+            or self.intersections or self.gaps
+        )
+
+    @property
+    def failing_names(self):
+        names = set(self.open) | set(self.non_manifold) | set(self.non_convex)
+        for left, right in self.intersections + self.gaps:
+            names.update((left, right))
+        return sorted(names)
+
+    def summary(self):
+        parts = []
+        for label, items in (
+            ("open", self.open),
+            ("non-manifold", self.non_manifold),
+            ("non-convex", self.non_convex),
+            ("intersecting pairs", self.intersections),
+            ("pairs closer than the gap tolerance", self.gaps),
+        ):
+            if items:
+                parts.append("{} {}".format(len(items), label))
+        return ", ".join(parts)
+
+
+def agr_checker_tolerances(scene):
+    """Convexity and gap tolerances of SINTEZ AGR Checker, in metres.
+
+    When the checker is installed its own scene settings are used, so a set
+    is judged exactly as the checker will judge it; otherwise its defaults.
+    """
+    settings = getattr(scene, "agr_scene_properties", None)
+    convex = getattr(settings, "ucx_convex_tolerance", None)
+    gap = getattr(settings, "ucx_gap_tolerance", None)
+    return (
+        float(convex) / 1000.0 if convex is not None else AGR_CHECKER_CONVEX_TOLERANCE,
+        float(gap) / 1000.0 if gap is not None else AGR_CHECKER_GAP_TOLERANCE,
+    )
+
+
+def _face_plane_convex(ob, tolerance):
+    """The face-plane convexity rule SINTEZ AGR Checker applies to a UCX.
+
+    For every face wider than the tolerance, the other vertices must not lie
+    beyond the tolerance on both sides of its plane. Normals, centres and
+    areas come from Blender's own mesh data, as in the checker.
+    """
+    mesh = ob.data
+    coordinates = [vertex.co for vertex in mesh.vertices]
+    for polygon in mesh.polygons:
+        normal = polygon.normal
+        if normal.length_squared < 0.5:
+            continue
+        longest = max(
+            (coordinates[a] - coordinates[b]).length for a, b in polygon.edge_keys
+        )
+        if longest <= 0.0 or 2.0 * polygon.area / longest < tolerance:
+            continue
+        center = polygon.center
+        own = set(polygon.vertices)
+        positive = negative = False
+        for index, co in enumerate(coordinates):
+            if index in own:
+                continue
+            distance = normal.dot(co - center)
+            if -tolerance < distance < tolerance:
+                continue
+            if distance > 0.0:
+                positive = True
+            else:
+                negative = True
+            if positive and negative:
+                return False
+    return True
+
+
+def _checker_collision_data(ob):
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(ob.data)
+        bm.transform(ob.matrix_world)
+        bm.normal_update()
+        vertices = [vertex.co.copy() for vertex in bm.verts]
+        planes = [(face.calc_center_median(), face.normal.copy()) for face in bm.faces]
+        bvh = BVHTree.FromBMesh(bm)
+    finally:
+        bm.free()
+    if vertices:
+        lower = Vector((min(v.x for v in vertices), min(v.y for v in vertices), min(v.z for v in vertices)))
+        upper = Vector((max(v.x for v in vertices), max(v.y for v in vertices), max(v.z for v in vertices)))
+    else:
+        lower = upper = Vector((0.0, 0.0, 0.0))
+    return {"bvh": bvh, "vertices": vertices, "planes": planes, "lower": lower, "upper": upper}
+
+
+def _checker_nested(vertices, planes, tolerance=0.0001):
+    if not vertices or not planes:
+        return False
+    return all(
+        (vertex - center).dot(normal) <= tolerance
+        for vertex in vertices
+        for center, normal in planes
+    )
+
+
+def agr_checker_report(colliders, convex_tolerance=None, gap_tolerance=None):
+    """Judge a UCX set by the rules SINTEZ AGR Checker applies to it.
+
+    Closure by Euler characteristic, non-manifold edges, the face-plane
+    convexity rule, and for every pair with touching bounds: triangle
+    overlap, one hull nested in another, and any vertex closer than the gap
+    tolerance to the other hull. Reimplemented from the checker's documented
+    behaviour so a generated set can be refused before the checker sees it.
+    """
+    if convex_tolerance is None:
+        convex_tolerance = AGR_CHECKER_CONVEX_TOLERANCE
+    if gap_tolerance is None:
+        gap_tolerance = AGR_CHECKER_GAP_TOLERANCE
+    report = AgrCheckerReport()
+    colliders = sorted(colliders, key=lambda item: item.name)
+    for ob in colliders:
+        mesh = ob.data
+        if len(mesh.vertices) - len(mesh.edges) + len(mesh.polygons) != 2:
+            report.open.append(ob.name)
+            continue
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            non_manifold = any(not edge.is_manifold for edge in bm.edges)
+        finally:
+            bm.free()
+        if non_manifold:
+            report.non_manifold.append(ob.name)
+            continue
+        if not _face_plane_convex(ob, convex_tolerance):
+            report.non_convex.append(ob.name)
+
+    data = {ob: _checker_collision_data(ob) for ob in colliders}
+    for index, left in enumerate(colliders):
+        first = data[left]
+        for right in colliders[index + 1:]:
+            second = data[right]
+            if (
+                first["lower"].x > second["upper"].x + gap_tolerance
+                or first["upper"].x < second["lower"].x - gap_tolerance
+                or first["lower"].y > second["upper"].y + gap_tolerance
+                or first["upper"].y < second["lower"].y - gap_tolerance
+                or first["lower"].z > second["upper"].z + gap_tolerance
+                or first["upper"].z < second["lower"].z - gap_tolerance
+            ):
+                continue
+            pair = (left.name, right.name)
+            if first["bvh"].overlap(second["bvh"]):
+                report.intersections.append(pair)
+                continue
+            if _checker_nested(second["vertices"], first["planes"]) or _checker_nested(
+                first["vertices"], second["planes"]
+            ):
+                report.intersections.append(pair)
+                continue
+            if any(
+                second["bvh"].find_nearest(vertex, gap_tolerance)[0] is not None
+                for vertex in first["vertices"]
+            ) or any(
+                first["bvh"].find_nearest(vertex, gap_tolerance)[0] is not None
+                for vertex in second["vertices"]
+            ):
+                report.gaps.append(pair)
+    return report
 
 
 def agr_triangle_budget(source_triangles):

@@ -76,8 +76,13 @@ _RU_DEFAULT = {
         "Части модели тоньше этого значения не получают коллизию"
     ),
     "Gap": "Зазор",
-    "Air gap between neighbouring hulls; 0.0002 m is the AGR minimum": (
-        "Воздушный зазор между соседними выпуклыми оболочками; 0,0002 м — минимум AGR"
+    (
+        "Air gap between neighbouring hulls; AGR recommends 0.2-10 mm, and "
+        "1 mm clears SINTEZ AGR Checker at any gap tolerance it allows"
+    ): (
+        "Воздушный зазор между соседними оболочками; AGR рекомендует 0,2–10 мм, "
+        "а 1 мм проходит проверку SINTEZ AGR Checker при любом допустимом в нём "
+        "допуске зазора"
     ),
     "Optimization Passes": "Проходы оптимизации",
     (
@@ -215,6 +220,21 @@ _RU_DEFAULT = {
     "Small: {} of {}; smallest {} in {}": "Мелких: {} из {}; меньше всего {} в {}",
     "No thin objects among {}": "Тонких объектов нет среди {}",
     "Thin: {} of {}; thinnest {} in {}": "Тонких: {} из {}; тоньше всего {} в {}",
+    "SINTEZ AGR Checker": "SINTEZ AGR Checker",
+    "Tolerances: convexity {:.1f} mm, gap {:.1f} mm": "Допуски: выпуклость {:.1f} мм, зазор {:.1f} мм",
+    (
+        "Select objects SINTEZ AGR Checker would reject: open, non-manifold or "
+        "non-convex by its face-plane rule, intersecting, or closer than its "
+        "gap tolerance; its own tolerances are used when it is installed"
+    ): (
+        "Выделяет объекты, которые отклонит SINTEZ AGR Checker: незамкнутые, "
+        "nonmanifold, невыпуклые по его правилу плоскостей граней, "
+        "пересекающиеся или стоящие ближе его допуска зазора; если он "
+        "установлен, берутся его собственные допуски"
+    ),
+    "SINTEZ checker passes all {}": "SINTEZ пропускает все {}",
+    "SINTEZ checker rejects {} of {}; first {}{}": "SINTEZ отклонит {} из {}; первый {}{}",
+    "SINTEZ checker rejects {} of {}": "SINTEZ отклонит {} из {}",
 }
 
 _RU_OPERATORS = {
@@ -225,6 +245,7 @@ _RU_OPERATORS = {
     "Select Concave Hulls": "Выделить вогнутые оболочки",
     "Select Small Parts": "Выделить мелкие части",
     "Select Thin Parts": "Выделить тонкие части",
+    "Select SINTEZ Checker Failures": "Выделить то, что отклонит SINTEZ",
 }
 
 TRANSLATIONS = {

@@ -7,6 +7,7 @@ import bpy
 from . import operators
 from . import translations
 from .core import naming
+from .core import validation
 
 
 def _configure_properties(layout):
@@ -226,6 +227,19 @@ class AGR_PT_collider_debugger(bpy.types.Panel):
         thin.operator(
             "xivgate_agr_collision.debug_thin",
             text="Select Thin Parts",
+            icon="RESTRICT_SELECT_OFF")
+
+        checker = layout.box()
+        checker.label(text="SINTEZ AGR Checker", icon="CHECKMARK")
+        convex_tolerance, gap_tolerance = validation.agr_checker_tolerances(context.scene)
+        checker.label(
+            text=translations.iface(
+                "Tolerances: convexity {:.1f} mm, gap {:.1f} mm").format(
+                convex_tolerance * 1000.0, gap_tolerance * 1000.0),
+            translate=False)
+        checker.operator(
+            "xivgate_agr_collision.debug_agr_checker",
+            text="Select SINTEZ Checker Failures",
             icon="RESTRICT_SELECT_OFF")
 
         if settings.debug_status:
