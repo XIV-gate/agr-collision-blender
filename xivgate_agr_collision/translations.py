@@ -12,7 +12,6 @@ _RU_DEFAULT = {
     "Last Result": "Последний результат",
     "Advanced Collision Settings": "Расширенные настройки коллизии",
     "Geometry Preprocessing": "Предварительная обработка геометрии",
-    "Convex Search Limits": "Ограничения поиска выпуклых частей",
     "Viewport Output": "Отображение результата",
     "Manual Cleanup": "Ручная очистка",
     "Topology-changing preprocess is enabled": (
@@ -37,26 +36,13 @@ _RU_DEFAULT = {
     ),
     "Source": "Источник",
     "No active mesh": "Нет активного меш-объекта",
-    "Accuracy": "Точность",
-    "Exact Geometry Repair": "Точное восстановление геометрии",
-    "Exact Split Limits": "Ограничения точного разбиения",
-    "Output": "Результат",
     "Status": "Статус",
     "Ready": "Готово",
     "Source: {}": "Источник: {}",
     "Input / working: {:,} / {:,} tris": "Исходных / рабочих: {:,} / {:,} трис",
     "UCX: {} objects, {:,} tris": "UCX: {} объектов, {:,} трис",
     "Max deviation: {:.3f} m": "Макс. отклонение: {:.3f} м",
-    "Tolerance": "Допуск",
-    "Maximum allowed collision deviation; 0.10 m is the strict universal AGR limit": (
-        "Максимально допустимое отклонение коллизии; 0,10 м — строгий "
-        "универсальный лимит AGR"
-    ),
     "Min Feature": "Мин. размер детали",
-    "Separate details smaller than this size may be removed during preprocessing": (
-        "Отдельные детали меньше этого размера могут быть удалены "
-        "при предварительной обработке"
-    ),
     (
         "When topology-changing preprocessing is explicitly enabled, "
         "separate details smaller than this size may be removed"
@@ -86,8 +72,8 @@ _RU_DEFAULT = {
         "крупнейший компонент никогда не удаляется"
     ),
     "Thin Threshold": "Порог толщины",
-    "Maximum thickness of separate components that may be ignored": (
-        "Максимальная толщина отдельных компонентов, которые можно игнорировать"
+    "Parts of the model thinner than this receive no collision": (
+        "Части модели тоньше этого значения не получают коллизию"
     ),
     "Gap": "Зазор",
     "Air gap between neighbouring hulls; 0.0002 m is the AGR minimum": (
@@ -95,21 +81,13 @@ _RU_DEFAULT = {
     ),
     "Optimization Passes": "Проходы оптимизации",
     (
-        "Try deterministic tie variants and keep the smallest complete result; "
-        "each pass runs the full search"
+        "Re-cut the parts that produced the most pieces and keep the "
+        "variant with fewer pieces; every variant stays exact, so more "
+        "passes only trade generation time for a simpler collision"
     ): (
-        "Проверяет детерминированные варианты с равной оценкой и сохраняет "
-        "наименьший полный результат; каждый проход выполняет полный поиск"
-    ),
-    "Seed": "Начальное значение",
-    "Base seed for deterministic split tie variants": (
-        "Базовый сид для детерминированных вариантов разбиения с равной оценкой"
-    ),
-    "Max Parts": "Макс. частей",
-    "Hard maximum number of UCX hulls": "Жёсткий максимум количества UCX-оболочек",
-    "Search Depth": "Глубина поиска",
-    "Maximum number of recursive separating planes": (
-        "Максимальное количество рекурсивных разделяющих плоскостей"
+        "Перерезает части, давшие больше всего кусков, и оставляет вариант "
+        "с меньшим их числом; каждый вариант остаётся точным, поэтому "
+        "дополнительные проходы меняют только время генерации"
     ),
     "Wire Display": "Каркасное отображение",
     "Display generated colliders as wireframe objects": (

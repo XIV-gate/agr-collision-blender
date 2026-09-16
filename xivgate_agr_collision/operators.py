@@ -319,8 +319,7 @@ def _create_collider_collection(
                 source_data.object_names,
                 ensure_ascii=False,
             )
-            ob["agr_tolerance"] = settings.tolerance
-            ob["agr_seed"] = result.seed
+            ob["agr_feature_tolerance"] = result.feature_tolerance
             ob.display_type = "WIRE" if settings.wire_display else "SOLID"
             ob.color = (0.12, 0.65, 1.0, 1.0)
             created.append(ob)

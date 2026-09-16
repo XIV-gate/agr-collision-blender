@@ -21,16 +21,6 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
         ),
         default=False,
     )
-    tolerance: FloatProperty(
-        name="Tolerance",
-        description="Maximum allowed collision deviation; 0.10 m is the strict universal AGR limit",
-        default=0.10,
-        min=0.01,
-        max=1.0,
-        precision=3,
-        subtype="DISTANCE",
-        unit="LENGTH",
-    )
     min_feature: FloatProperty(
         name="Min Feature",
         description=(
@@ -69,7 +59,7 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
     )
     thin_threshold: FloatProperty(
         name="Thin Threshold",
-        description="Maximum thickness of separate components that may be ignored",
+        description="Parts of the model thinner than this receive no collision",
         default=0.05,
         min=0.005,
         max=0.25,
@@ -90,30 +80,14 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
 
     attempts: IntProperty(
         name="Optimization Passes",
-        description="Try deterministic tie variants and keep the smallest complete result; each pass runs the full search",
+        description=(
+            "Re-cut the parts that produced the most pieces and keep the "
+            "variant with fewer pieces; every variant stays exact, so more "
+            "passes only trade generation time for a simpler collision"
+        ),
         default=1,
         min=1,
-        max=24,
-    )
-    seed: IntProperty(
-        name="Seed",
-        description="Base seed for deterministic split tie variants",
-        default=0,
-        min=0,
-    )
-    max_parts: IntProperty(
-        name="Max Parts",
-        description="Hard maximum number of UCX hulls",
-        default=128,
-        min=1,
         max=999,
-    )
-    max_depth: IntProperty(
-        name="Search Depth",
-        description="Maximum number of recursive separating planes",
-        default=24,
-        min=1,
-        max=24,
     )
 
     wire_display: BoolProperty(
