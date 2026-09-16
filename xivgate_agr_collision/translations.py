@@ -81,13 +81,17 @@ _RU_DEFAULT = {
     ),
     "Optimization Passes": "Проходы оптимизации",
     (
-        "Re-cut the parts that produced the most pieces and keep the "
-        "variant with fewer pieces; every variant stays exact, so more "
-        "passes only trade generation time for a simpler collision"
+        "Re-cut the parts that produced the most pieces and keep "
+        "variants with fewer pieces; every variant stays exact, so more "
+        "passes only trade generation time for a simpler collision. "
+        "1 is a single fast pass; around 100 gives the smallest sets on "
+        "complex buildings in a few minutes"
     ): (
-        "Перерезает части, давшие больше всего кусков, и оставляет вариант "
+        "Перерезает части, давшие больше всего кусков, и оставляет варианты "
         "с меньшим их числом; каждый вариант остаётся точным, поэтому "
-        "дополнительные проходы меняют только время генерации"
+        "дополнительные проходы меняют только время генерации. 1 — один "
+        "быстрый проход; около 100 даёт самые экономные наборы на сложных "
+        "зданиях за несколько минут"
     ),
     "Wire Display": "Каркасное отображение",
     "Display generated colliders as wireframe objects": (

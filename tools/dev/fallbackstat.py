@@ -10,7 +10,7 @@ from xivgate_agr_collision.core import decompose as D
 d = np.load(argv[1])
 stats = {"primary": 0, "fallback": 0, "none": 0, "primary_tried": 0, "fallback_pieces": []}
 orig_cut = D._cut_piece
-orig_split = D._split_piece
+orig_split = D._split_piece_keyed
 orig_fallback = D._fallback_planes
 state = {"stage": "primary", "fails": 0}
 
@@ -27,10 +27,10 @@ def fallback(piece, limit=8):
     return orig_fallback(piece, limit)
 
 
-def split(piece, thin_limit):
+def split(piece, thin_limit, skip=0):
     state["stage"] = "primary"
     state["fails"] = 0
-    children = orig_split(piece, thin_limit)
+    key, children = orig_split(piece, thin_limit, skip)
     if children is None:
         stats["none"] += 1
     elif state["stage"] == "fallback":
@@ -41,11 +41,11 @@ def split(piece, thin_limit):
     else:
         stats["primary"] += 1
     stats["primary_tried"] += state["fails"]
-    return children
+    return key, children
 
 
 D._cut_piece = cut
-D._split_piece = split
+D._split_piece_keyed = split
 D._fallback_planes = fallback
 result = D.decompose(
     SimpleNamespace(vertices=d["v"], faces=d["f"]),

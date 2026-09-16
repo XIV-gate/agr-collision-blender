@@ -53,6 +53,12 @@ MAX_CUT_ATTEMPTS = 32
 CUT_LOOKAHEAD = 12
 # Alternative cuts tried per node during the refinement search.
 REFINEMENT_TRIES = 3
+# How far down its ranked planes the variant search walks one node.
+SEARCH_MAX_SKIP = 24
+# Largest share of the model's cutting work one re-cut node may carry.
+SEARCH_WORK_SHARE = 0.25
+# Real variants such a node may try before it is retired.
+SEARCH_HEAVY_VARIANTS = 1
 # Automatic depth tolerance for shallow steps, as a share of the thin-part
 # threshold: 0.4 of 5 cm lets a hull bridge steps and recesses up to 2 cm.
 FEATURE_TOLERANCE_RATIO = 0.4
@@ -471,6 +477,15 @@ def _piece_planes(vertices, faces, topology=None):
     owners = owners[order]
     others = others[order]
     starts = np.searchsorted(owners, np.arange(len(faces) + 1))
+    # The walk below reads neighbours one face at a time, so the adjacency is
+    # handed to it as plain lists; slicing a numpy array per face cost more
+    # than the lookup itself.
+    others_list = others.tolist()
+    starts_list = starts.tolist()
+    neighbours = [
+        others_list[starts_list[face]:starts_list[face + 1]]
+        for face in range(len(faces))
+    ]
 
     diameter = max(float(np.ptp(vertices, axis=0).max()), MIN_FACET_SIZE)
     assigned = np.zeros(len(faces), dtype=bool)
@@ -482,22 +497,20 @@ def _piece_planes(vertices, faces, topology=None):
             continue
         unit = normals[seed]
         offset = float(unit @ corners[seed, 0])
+        # Every face is tested against this plane once, vectorised, instead
+        # of three numpy calls per face inside the walk below. On small
+        # fragments the call overhead of those tiny operations dominated the
+        # arithmetic, and this function is a third of the whole run.
+        on_plane = np.all(
+            np.abs(corners @ unit - offset) <= FACET_EPSILON, axis=1
+        ).tolist()
         members = [int(seed)]
         assigned[seed] = True
         stack = [int(seed)]
         while stack:
             face = stack.pop()
-            candidates = others[starts[face]:starts[face + 1]]
-            candidates = candidates[~assigned[candidates]]
-            if len(candidates) == 0:
-                continue
-            flat = np.all(
-                np.abs(corners[candidates] @ unit - offset) <= FACET_EPSILON,
-                axis=(1,),
-            )
-            for other in candidates[flat]:
-                other = int(other)
-                if assigned[other]:
+            for other in neighbours[face]:
+                if assigned[other] or not on_plane[other]:
                     continue
                 assigned[other] = True
                 members.append(other)
@@ -1324,32 +1337,54 @@ def _fallback_planes(piece, limit=8):
     )
 
 
-def _split_piece(piece, thin_limit, skip=0):
-    """Cut a piece. With skip > 0 the best ranked planes are passed over,
-    which yields a different, equally exact variant of the subtree."""
+def _split_piece_keyed(piece, thin_limit, skip=0):
+    """Cut a piece and name the cut that was taken.
+
+    With skip > 0 the best ranked planes are passed over, which yields a
+    different, equally exact variant of the subtree. The name is the stage
+    the plane came from and its position in that stage's ranking, so the
+    search can tell two variants that took the same cut apart from two that
+    did not.
+
+    Rankings and cuts are kept on the piece. The variant search asks for the
+    same piece again with the window moved by one plane; the window shares
+    all but one plane with the previous one, and without the cache every one
+    of them was ranked and cut again.
+    """
     violated = getattr(piece, "violated_planes", None)
     if violated is None:
-        return None
+        return None, None
     stages = (
         lambda: violated,
         lambda: getattr(piece, "facet_planes", None),
         lambda: _fallback_planes(piece),
     )
-    for stage in stages:
-        planes = stage()
-        if planes is None:
+    rankings = piece.__dict__.setdefault("_rankings", {})
+    cuts = piece.__dict__.setdefault("_cuts", {})
+    for stage_index, stage in enumerate(stages):
+        ranking_key = (stage_index, thin_limit)
+        if ranking_key in rankings:
+            ranked = rankings[ranking_key]
+        else:
+            planes = stage()
+            ranked = None if planes is None else _rank_planes(
+                piece, *planes, thin_limit
+            )
+            rankings[ranking_key] = ranked
+        if ranked is None:
             continue
-        normals, offsets, areas, tolerances, centroids = planes
-        ranked = _rank_planes(
-            piece, normals, offsets, areas, tolerances, centroids, thin_limit
-        )
         options = []
-        for normal, offset in ranked[skip:skip + MAX_CUT_ATTEMPTS]:
-            result = _cut_piece(piece, normal * offset, normal)
-            if result is None:
+        for position in range(skip, min(skip + MAX_CUT_ATTEMPTS, len(ranked))):
+            cut_key = (stage_index, position)
+            if cut_key in cuts:
+                children = cuts[cut_key]
+            else:
+                normal, offset = ranked[position]
+                result = _cut_piece(piece, normal * offset, normal)
+                children = None if result is None else result[0] + result[1]
+                cuts[cut_key] = children
+            if children is None:
                 continue
-            negative, positive = result
-            children = negative + positive
             if len(children) >= 2 or (
                 len(children) == 1
                 and children[0].concave_edges < piece.concave_edges
@@ -1357,14 +1392,29 @@ def _split_piece(piece, thin_limit, skip=0):
                 remaining = sum(child.concave_edges for child in children)
                 slivers = sum(
                     1 for child in children
-                    if float(_piece_extents(child)[-1]) < thin_limit
+                    if _cached_extent(child) < thin_limit
                 )
-                options.append((slivers, remaining, len(options), children))
+                options.append((slivers, remaining, len(options), children, cut_key))
+                if slivers == 0 and remaining == 0:
+                    # Children convex and none of them thin. The ranking key
+                    # is (slivers, remaining, order), so nothing tried later
+                    # can beat this and the selection below would pick it
+                    # anyway; stopping here only skips work.
+                    break
                 if len(options) >= CUT_LOOKAHEAD:
                     break
         if options:
-            return min(options, key=lambda item: item[:3])[3]
-    return None
+            best = min(options, key=lambda item: item[:3])
+            return best[4], best[3]
+    return None, None
+
+
+def _cached_extent(piece):
+    extent = piece.__dict__.get("_last_extent")
+    if extent is None:
+        extent = float(_piece_extents(piece)[-1])
+        piece._last_extent = extent
+    return extent
 
 
 # --------------------------------------------------------------------------
@@ -1391,19 +1441,26 @@ def _convex_planes(piece):
     if len(faces) == 0 or len(vertices) == 0:
         return []
     normals, areas = _face_normals(vertices, faces)
-    planes = {}
-    for index in np.argsort(-areas):
-        if areas[index] <= 1.0e-12:
-            continue
-        normal = normals[index]
-        projection = vertices @ normal
-        point = vertices[int(projection.argmax())]
-        key = (
-            *np.round(normal * 1.0e4).astype(np.int64).tolist(),
-            int(round(float(projection.max()) * 1.0e4)),
-        )
-        planes.setdefault(key, (point, normal))
-    return list(planes.values())
+    order = np.argsort(-areas)
+    order = order[areas[order] > 1.0e-12]
+    if len(order) == 0:
+        return []
+    kept = normals[order]
+    # One projection of every vertex against every candidate normal replaces
+    # a projection per face; this runs for each overlap test, tens of
+    # thousands of times per decomposition.
+    projection = vertices @ kept.T
+    support = projection.argmax(axis=0)
+    keys = np.column_stack((
+        np.round(kept * 1.0e4).astype(np.int64),
+        np.round(projection[support, np.arange(len(order))] * 1.0e4).astype(np.int64),
+    ))
+    # First occurrence wins, in descending area order, as the dict did.
+    _unique, first = np.unique(keys, axis=0, return_index=True)
+    first = np.sort(first)
+    return [
+        (vertices[support[index]], kept[index]) for index in first.tolist()
+    ]
 
 
 def _plane_arrays(planes):
@@ -1429,23 +1486,23 @@ def _point_inside_convex(point, planes, epsilon=1.0e-7):
 
 def _convex_test_samples(piece):
     vertices = piece.vertices
-    centroids = vertices[piece.faces].mean(axis=1)
-    edges = set()
-    for triangle in piece.faces:
-        for left, right in (
-            (triangle[0], triangle[1]),
-            (triangle[1], triangle[2]),
-            (triangle[2], triangle[0]),
-        ):
-            edges.add((min(int(left), int(right)), max(int(left), int(right))))
-    edge_samples = np.asarray(
-        [
-            vertices[left] * (1.0 - fraction) + vertices[right] * fraction
-            for left, right in sorted(edges)
-            for fraction in (0.25, 0.5, 0.75)
-        ],
-        dtype=np.float64,
-    ).reshape((-1, 3))
+    faces = np.asarray(piece.faces, dtype=np.int64)
+    centroids = vertices[faces].mean(axis=1)
+    # The samples are only ever asked whether any of them is inside another
+    # hull, so their order carries no meaning and the edge set can be built
+    # with numpy instead of a Python set over every triangle.
+    pairs = np.sort(
+        np.concatenate((faces[:, :2], faces[:, 1:], faces[:, ::2]), axis=0),
+        axis=1,
+    )
+    pairs = np.unique(pairs, axis=0)
+    left = vertices[pairs[:, 0]]
+    right = vertices[pairs[:, 1]]
+    edge_samples = np.concatenate(
+        [left * (1.0 - fraction) + right * fraction
+         for fraction in (0.25, 0.5, 0.75)],
+        axis=0,
+    )
     return np.vstack((vertices, edge_samples, centroids))
 
 
@@ -2339,10 +2396,24 @@ class _Node:
     skip: int = 0
     exhausted: bool = False
     parent: object = None
+    cut_key: object = None
 
     @property
     def count(self):
         return len(self.leaves) + sum(child.count for child in self.children)
+
+    @property
+    def work(self):
+        """Triangles that re-cutting this subtree has to process again.
+
+        A deterministic stand-in for the time a variant costs: every internal
+        node analyses and cuts its piece, and that effort grows with the
+        piece's triangles. Wall time would order the search differently on a
+        faster machine, and the same model must cut the same way everywhere.
+        """
+        if not self.children:
+            return 0
+        return len(self.piece.faces) + sum(child.work for child in self.children)
 
     @property
     def thin_count(self):
@@ -2392,10 +2463,16 @@ def _decompose_node(piece, thin_limit, budget, skip=0):
     if budget[0] <= 0:
         node.invalid.append(piece)
         return node
-    children = _split_piece(piece, thin_limit, skip=skip)
+    key, children = _split_piece_keyed(piece, thin_limit, skip=skip)
     if children is None:
         node.invalid.append(piece)
         return node
+    return _grow_node(node, key, children, thin_limit, budget)
+
+
+def _grow_node(node, key, children, thin_limit, budget):
+    """Attach the subtrees of an already chosen cut to its node."""
+    node.cut_key = key
     budget[0] -= 1
     for child in children:
         child_node = _decompose_node(child, thin_limit, budget)
@@ -2404,16 +2481,40 @@ def _decompose_node(piece, thin_limit, budget, skip=0):
     return node
 
 
+def _search_priority(node):
+    """Parts per triangle of the node's own piece.
+
+    Ordering by parts per unit of whole-subtree work was measured as well and
+    is worse: it harvests the deep nodes first, after which the middle of the
+    tree has little left to give, and the tower still ended at 248 parts after
+    running the search to exhaustion.
+    """
+    return node.count / max(len(node.piece.faces), 1)
+
+
 def _refine_tree(roots, thin_limit, passes):
     """Re-cut the parts that produced the most pieces and keep improvements.
 
-    Every cut of the tree is exact, so any node can be cut again along its
-    next ranked plane. The variant replaces the old subtree only when it ends
+    Every cut of the tree is exact, so any node can be cut again along a
+    later ranked plane. A variant replaces the old subtree only when it ends
     in fewer parts, so the search can only improve the result.
+
+    The node to re-cut is the one with the most parts per triangle. It is
+    not retired after a few tries: it keeps walking down its ranked planes
+    until they run out, and a node that has improved once is free to improve
+    again. On the reference tower 297 variants now end at 259 parts in about
+    six and a half minutes; retiring nodes after three tries stopped at 267
+    after eleven.
+
+    Moving the window by one plane often leaves the best cut in it unchanged,
+    and such a variant would rebuild a subtree that has already been judged.
+    Those are recognised by the name of their top cut and skipped without
+    being counted as a variant.
     """
     improved = 0
     attempts = 0
     while attempts < passes:
+        work_limit = SEARCH_WORK_SHARE * sum(root.work for root in roots)
         candidates = []
         for root in roots:
             candidates += [
@@ -2422,34 +2523,43 @@ def _refine_tree(roots, thin_limit, passes):
             ]
         if not candidates:
             break
-        # Most parts per unit of work: a subtree that ends in many pieces but
-        # holds few triangles is both the cheapest to re-cut and the most
-        # likely to improve.
-        candidates.sort(
-            key=lambda node: -node.count / max(len(node.piece.faces), 1)
-        )
-        node = candidates[0]
-        best = None
-        for skip in range(node.skip + 1, node.skip + 4):
-            if attempts >= passes:
-                break
-            attempts += 1
-            budget = [LEAF_LIMIT]
-            variant = _decompose_node(node.piece, thin_limit, budget, skip=skip)
-            if variant.invalid or variant.score >= node.score:
-                continue
-            if best is None or variant.score < best.score:
-                best = variant
-        node.exhausted = True
-        if best is None:
+        node = max(candidates, key=_search_priority)
+        tried = node.__dict__.setdefault("tried", {node.cut_key})
+        skip = node.__dict__.get("next_skip", node.skip) + 1
+        node.next_skip = skip
+        if skip > SEARCH_MAX_SKIP:
+            node.exhausted = True
             continue
-        improved += node.count - best.count
-        best.parent = node.parent
-        best.exhausted = True
+        key, children = _split_piece_keyed(node.piece, thin_limit, skip=skip)
+        if children is None:
+            node.exhausted = True
+            continue
+        if key in tried:
+            continue
+        if node.work > work_limit and len(tried) > SEARCH_HEAVY_VARIANTS:
+            # A node holding a large share of the model is close to a restart
+            # of the whole decomposition. It gets one real variant: excluding
+            # such nodes entirely cost the tower 247 -> 266 parts, because a
+            # single accepted re-cut near the root reshapes everything below,
+            # but its further variants took 353 s and gave nothing back.
+            node.exhausted = True
+            continue
+        tried.add(key)
+        attempts += 1
+        budget = [LEAF_LIMIT]
+        variant = _grow_node(
+            _Node(piece=node.piece, skip=skip), key, children, thin_limit, budget
+        )
+        if variant.invalid or variant.score >= node.score:
+            continue
+        improved += node.count - variant.count
+        variant.parent = node.parent
+        variant.tried = tried
+        variant.next_skip = skip
         if node.parent is None:
-            roots[roots.index(node)] = best
+            roots[roots.index(node)] = variant
         else:
-            node.parent.children[node.parent.children.index(node)] = best
+            node.parent.children[node.parent.children.index(node)] = variant
     return roots, improved, attempts
 
 

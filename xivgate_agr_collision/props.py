@@ -81,9 +81,11 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
     attempts: IntProperty(
         name="Optimization Passes",
         description=(
-            "Re-cut the parts that produced the most pieces and keep the "
-            "variant with fewer pieces; every variant stays exact, so more "
-            "passes only trade generation time for a simpler collision"
+            "Re-cut the parts that produced the most pieces and keep "
+            "variants with fewer pieces; every variant stays exact, so more "
+            "passes only trade generation time for a simpler collision. "
+            "1 is a single fast pass; around 100 gives the smallest sets on "
+            "complex buildings in a few minutes"
         ),
         default=1,
         min=1,

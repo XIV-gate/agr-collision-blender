@@ -12,12 +12,12 @@ d = np.load(argv[1])
 corner = np.array([float(x) for x in argv[2].split(",")])
 
 splits = []
-orig_split = D._split_piece
+orig_split = D._split_piece_keyed
 
 
-def split(piece, thin_limit):
+def split(piece, thin_limit, skip=0):
     low, high = piece.vertices.min(0), piece.vertices.max(0)
-    children = orig_split(piece, thin_limit)
+    key, children = orig_split(piece, thin_limit, skip)
     if np.all(corner >= low - 0.05) and np.all(corner <= high + 0.05):
         kids = [] if children is None else [
             (round(float(c.volume), 4), np.round(np.ptp(c.vertices, axis=0), 2).tolist())
@@ -25,10 +25,10 @@ def split(piece, thin_limit):
         ]
         splits.append((round(float(piece.volume), 3),
                        np.round(np.ptp(piece.vertices, axis=0), 2).tolist(), kids))
-    return children
+    return key, children
 
 
-D._split_piece = split
+D._split_piece_keyed = split
 captured = {}
 orig_merge = D._merge_within_tolerance
 
