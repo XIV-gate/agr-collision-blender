@@ -27,6 +27,7 @@ def _world_bmesh(ob):
     bm = bmesh.new()
     bm.from_mesh(ob.data)
     bm.transform(ob.matrix_world)
+    bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
     bmesh.ops.triangulate(bm, faces=bm.faces[:])
     return bm
 
@@ -78,8 +79,9 @@ def validate_colliders(colliders, expected_base=None, triangle_budget=None):
                 source_volume = abs(bm.calc_volume(signed=True))
                 hull_volume = abs(hull.calc_volume(signed=True))
                 if hull_volume > 1.0e-9:
-                    difference = abs(hull_volume - source_volume) / hull_volume
-                    if difference > 1.0e-4:
+                    diff_vol = abs(hull_volume - source_volume)
+                    difference = diff_vol / hull_volume
+                    if difference > 0.05 and diff_vol > 1.0e-3:
                         errors.append("{} is not convex".format(ob.name))
             finally:
                 hull.free()

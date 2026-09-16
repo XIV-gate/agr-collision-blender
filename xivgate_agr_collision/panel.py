@@ -55,8 +55,9 @@ class AGR_PT_collider(bpy.types.Panel):
 
         quality = layout.box()
         quality.label(text="Collision Quality", icon="MODIFIER")
-        quality.prop(settings, "tolerance")
         quality.prop(settings, "gap")
+        quality.prop(settings, "thin_threshold")
+        quality.prop(settings, "attempts")
         if settings.destructive_preprocess:
             quality.label(
                 text="Topology-changing preprocess is enabled",
@@ -136,18 +137,6 @@ class AGR_PT_collider_advanced(bpy.types.Panel):
         fuse.prop(settings, "fuse_distance")
         controls.prop(settings, "min_feature")
         controls.prop(settings, "skip_thin")
-        thin = controls.column()
-        thin.enabled = settings.skip_thin
-        thin.prop(settings, "thin_threshold")
-
-        search = layout.box()
-        search.label(text="Convex Search Limits", icon="MOD_BOOLEAN")
-        row = search.row(align=True)
-        row.prop(settings, "attempts")
-        row.prop(settings, "seed")
-        row = search.row(align=True)
-        row.prop(settings, "max_parts")
-        row.prop(settings, "max_depth")
 
         display = layout.box()
         display.label(text="Viewport Output", icon="HIDE_OFF")
