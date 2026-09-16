@@ -92,6 +92,58 @@ class AGRCollisionSettings(bpy.types.PropertyGroup):
         max=999,
     )
 
+    debug_collection: PointerProperty(
+        name="Check Collection",
+        description=(
+            "Collection the collision debugger checks; the last generated "
+            "collision set is filled in automatically"
+        ),
+        type=bpy.types.Collection,
+    )
+    debug_colliders_only: BoolProperty(
+        name="UCX Objects Only",
+        description="Check only UCX collision objects and skip other meshes in the collection",
+        default=True,
+    )
+    debug_concavity_tolerance: FloatProperty(
+        name="Concavity Tolerance",
+        description=(
+            "Select objects whose surface sinks deeper than this below their "
+            "own convex hull; 0 finds every concavity above float32 rounding"
+        ),
+        default=0.0,
+        min=0.0,
+        soft_max=0.01,
+        precision=6,
+        step=0.001,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+    debug_min_volume: FloatProperty(
+        name="Volume Below",
+        description="Select objects whose enclosed volume is smaller than this",
+        default=0.001,
+        min=0.0,
+        soft_max=1.0,
+        precision=6,
+        step=0.01,
+        unit="VOLUME",
+    )
+    debug_min_thickness: FloatProperty(
+        name="Thickness Below",
+        description="Select objects whose exact minimum thickness is smaller than this",
+        default=0.05,
+        min=0.0,
+        soft_max=1.0,
+        precision=4,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
+    debug_status: StringProperty(
+        name="Debugger Status",
+        default="",
+    )
+
     wire_display: BoolProperty(
         name="Wire Display",
         description="Display generated colliders as wireframe objects",

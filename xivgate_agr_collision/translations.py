@@ -149,6 +149,72 @@ _RU_DEFAULT = {
     "Validation passed": "Проверка пройдена",
     "Validation failed": "Проверка не пройдена",
     "Removed {} collider(s)": "Удалено коллайдеров: {}",
+    "Collision Debugger": "Отладчик коллизии",
+    "Check Collection": "Проверяемая коллекция",
+    (
+        "Collection the collision debugger checks; the last generated "
+        "collision set is filled in automatically"
+    ): (
+        "Коллекция, которую проверяет отладчик; последний созданный набор "
+        "коллизии подставляется автоматически"
+    ),
+    "UCX Objects Only": "Только UCX-объекты",
+    "Check only UCX collision objects and skip other meshes in the collection": (
+        "Проверять только UCX-объекты коллизии и пропускать остальные меши коллекции"
+    ),
+    "Concavity": "Вогнутость",
+    "Concavity Tolerance": "Допуск вогнутости",
+    (
+        "Select objects whose surface sinks deeper than this below their "
+        "own convex hull; 0 finds every concavity above float32 rounding"
+    ): (
+        "Выделяет объекты, поверхность которых уходит под собственную "
+        "выпуклую оболочку глубже этого значения; 0 находит любую вогнутость "
+        "крупнее округления float32"
+    ),
+    "Small Parts": "Мелкие части",
+    "Volume Below": "Объём меньше",
+    "Select objects whose enclosed volume is smaller than this": (
+        "Выделяет объекты, замкнутый объём которых меньше этого значения"
+    ),
+    "Thin Parts": "Тонкие части",
+    "Thickness Below": "Толщина меньше",
+    "Select objects whose exact minimum thickness is smaller than this": (
+        "Выделяет объекты, точная минимальная толщина которых меньше этого значения"
+    ),
+    "Debugger Status": "Статус отладчика",
+    (
+        "Select objects whose surface sinks below their own convex hull, "
+        "including open meshes; the deepest one becomes active"
+    ): (
+        "Выделяет объекты, поверхность которых уходит под собственную выпуклую "
+        "оболочку, а также незамкнутые меши; самый глубокий становится активным"
+    ),
+    (
+        "Select objects whose enclosed volume is below the threshold; the "
+        "smallest one becomes active"
+    ): (
+        "Выделяет объекты с объёмом меньше порога; самый маленький становится активным"
+    ),
+    (
+        "Select objects whose exact minimum thickness is below the threshold; "
+        "the thinnest one becomes active"
+    ): (
+        "Выделяет объекты с минимальной толщиной меньше порога; самый тонкий "
+        "становится активным"
+    ),
+    "Objects to check: {}": "Объектов для проверки: {}",
+    "No mesh objects to check": "Нет меш-объектов для проверки",
+    " ({} hidden, not selected)": " (скрыто и не выделено: {})",
+    "{:.4f} mm": "{:.4f} мм",
+    "{:.6f} m3": "{:.6f} м³",
+    "open mesh": "незамкнутый меш",
+    "No concave objects among {}": "Вогнутых объектов нет среди {}",
+    "Concave: {} of {}; deepest {} in {}": "Вогнутых: {} из {}; глубже всего {} в {}",
+    "No small objects among {}": "Мелких объектов нет среди {}",
+    "Small: {} of {}; smallest {} in {}": "Мелких: {} из {}; меньше всего {} в {}",
+    "No thin objects among {}": "Тонких объектов нет среди {}",
+    "Thin: {} of {}; thinnest {} in {}": "Тонких: {} из {}; тоньше всего {} в {}",
 }
 
 _RU_OPERATORS = {
@@ -156,6 +222,9 @@ _RU_OPERATORS = {
     "Generate / Regenerate": "Создать / пересоздать",
     "Validate Colliders": "Проверить коллайдеры",
     "Remove Generated": "Удалить созданное",
+    "Select Concave Hulls": "Выделить вогнутые оболочки",
+    "Select Small Parts": "Выделить мелкие части",
+    "Select Thin Parts": "Выделить тонкие части",
 }
 
 TRANSLATIONS = {

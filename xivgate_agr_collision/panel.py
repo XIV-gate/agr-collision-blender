@@ -180,9 +180,62 @@ class AGR_PT_collider_advanced(bpy.types.Panel):
             icon="TRASH")
 
 
+class AGR_PT_collider_debugger(bpy.types.Panel):
+    bl_label = "Collision Debugger"
+    bl_idname = "XIVGATE_PT_agr_collision_debugger"
+    bl_parent_id = "XIVGATE_PT_agr_collision"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_order = 2
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.xivgate_agr_collision
+        _configure_properties(layout)
+
+        target = layout.box()
+        target.label(text="Check Collection", icon="OUTLINER_COLLECTION")
+        target.prop(settings, "debug_collection", text="")
+        target.prop(settings, "debug_colliders_only")
+        if settings.debug_collection is not None:
+            target.label(
+                text=translations.iface("Objects to check: {}").format(
+                    len(operators.debug_targets(settings))),
+                translate=False)
+
+        concave = layout.box()
+        concave.label(text="Concavity", icon="MOD_SMOOTH")
+        concave.prop(settings, "debug_concavity_tolerance")
+        concave.operator(
+            "xivgate_agr_collision.debug_concave",
+            text="Select Concave Hulls",
+            icon="RESTRICT_SELECT_OFF")
+
+        small = layout.box()
+        small.label(text="Small Parts", icon="SNAP_VOLUME")
+        small.prop(settings, "debug_min_volume")
+        small.operator(
+            "xivgate_agr_collision.debug_small",
+            text="Select Small Parts",
+            icon="RESTRICT_SELECT_OFF")
+
+        thin = layout.box()
+        thin.label(text="Thin Parts", icon="MOD_SOLIDIFY")
+        thin.prop(settings, "debug_min_thickness")
+        thin.operator(
+            "xivgate_agr_collision.debug_thin",
+            text="Select Thin Parts",
+            icon="RESTRICT_SELECT_OFF")
+
+        if settings.debug_status:
+            layout.label(text=settings.debug_status, icon="INFO", translate=False)
+
+
 CLASSES = (
     AGR_PT_collider,
     AGR_PT_collider_advanced,
+    AGR_PT_collider_debugger,
 )
 
 

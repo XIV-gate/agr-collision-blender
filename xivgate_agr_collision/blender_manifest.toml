@@ -21,6 +21,8 @@ paths = [
   "__init__.py",
   "core/__init__.py",
   "core/decompose.py",
+  "core/hull64.py",
+  "core/inspection.py",
   "core/naming.py",
   "core/source.py",
   "core/validation.py",
