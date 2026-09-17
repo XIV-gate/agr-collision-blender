@@ -98,6 +98,9 @@ pivot = np.array([-48.0, 73.0, 0.0])
 tri_before = tri_after = 0
 bad_tri = {0.01: 0, 0.001: 0, 0.0001: 0}
 bad_poly = {0.01: 0, 0.001: 0, 0.0001: 0}
+bad_fan = {0.01: 0, 0.001: 0, 0.0001: 0}
+bad_wide = {0.01: 0, 0.001: 0, 0.0001: 0}
+tri_wide = 0
 worst = 0.0
 for i in range(n):
     verts = d["v%d" % i].astype(np.float64)
@@ -106,7 +109,7 @@ for i in range(n):
     rounded = (verts - pivot).astype(np.float32).astype(np.float64) + pivot
     for tol in bad_tri:
         bad_tri[tol] += int(sintez_bad_faces(rounded, faces.tolist(), tol) > 0)
-    v, polys = H.planar_polytope(verts, 1e-5)
+    v, polys = H.planar_polytope(verts, float(sys.argv[3]) if len(sys.argv) > 3 else 1e-5)
     ok, why = surface_ok(v, polys)
     if not ok:
         print("hull %d: %s" % (i, why))
@@ -116,8 +119,16 @@ for i in range(n):
     rv = (v - pivot).astype(np.float32).astype(np.float64) + pivot
     for tol in bad_poly:
         bad_poly[tol] += int(sintez_bad_faces(rv, polys, tol) > 0)
+    fan = H.fan_triangles(polys).tolist()
+    wide = H.wide_triangles(v, polys).tolist()
+    tri_wide += len(wide)
+    for tol in bad_fan:
+        bad_fan[tol] += int(sintez_bad_faces(rv, fan, tol) > 0)
+        bad_wide[tol] += int(sintez_bad_faces(rv, wide, tol) > 0)
 print("tower hulls: worst relative volume vs exact hull %.1e" % worst)
 print("triangles: %d before, %d after" % (tri_before, tri_after))
+print("wide triangulation: %d triangles" % tri_wide)
+print("hulls rejected by SINTEZ-style rule after float32 rounding:")
+print("%-9s %12s %9s %12s %14s" % ("tolerance", "old output", "polygons", "fan triangles", "wide triangles"))
 for tol in (0.01, 0.001, 0.0001):
-    print("SINTEZ-style non-convex at %.1f mm: triangles %d  ->  planar polygons %d" % (
-        tol * 1000, bad_tri[tol], bad_poly[tol]))
+    print("%-9s %12d %9d %12d %14d" % ("%.1f mm" % (tol * 1000), bad_tri[tol], bad_poly[tol], bad_fan[tol], bad_wide[tol]))

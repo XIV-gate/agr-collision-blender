@@ -62,9 +62,17 @@ SEARCH_MAX_SKIP = 24
 SEARCH_WORK_SHARE = 0.25
 # Real variants such a node may try before it is retired.
 SEARCH_HEAVY_VARIANTS = 1
-# Output hulls merge hull triangles into one planar polygon when their
-# corners lie this close to a common plane.
-OUTPUT_MERGE_DISTANCE = 1.0e-5
+# Hull triangles are merged into one planar facet when their corners lie this
+# close to a common plane. Measured on the reference tower against the
+# SINTEZ AGR Checker rule after float32 rounding: 10 um left facets bent
+# enough to tilt their triangles, 0.1 um and below brought needles back.
+OUTPUT_MERGE_DISTANCE = 1.0e-6
+# Output triangles whose hull is more than NEEDLE_ASPECT times longer than
+# they are wide are removed by dropping a corner, as long as the hull retreats
+# by at most NEEDLE_MAX_LOSS. Such a triangle has a plane decided by float32
+# rounding, which SINTEZ AGR Checker misreads.
+NEEDLE_ASPECT = 100.0
+NEEDLE_MAX_LOSS = 0.005
 # Up to this many face planes the gap inset intersects every plane triple;
 # above it only planes of neighbouring faces.
 INSET_GLOBAL_PLANES = 48
@@ -105,9 +113,6 @@ class DecompositionResult:
     ignored_parts: list = field(default_factory=list)
     failed_parts: list = field(default_factory=list)
     feature_tolerance: float = 0.0
-    # Planar polygon faces of each hull, as vertex index lists, in the order
-    # of ``hulls``; the triangles in ``hulls`` are their fans.
-    polygons: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -2141,17 +2146,27 @@ def _reliable_hull_planes(vertices, faces):
     return planes, incident
 
 
-def _polytope_piece(vertices, depth=0):
-    """Exact convex polytope of the points, with planar polygon faces.
+def _polytope_piece(vertices, depth=0, simplify=False):
+    """Exact convex polytope of the points, triangulated facet by facet.
 
-    The piece keeps fan triangles in ``faces`` for everything that measures
-    it, and the polygons themselves in ``polygons`` for the output mesh.
+    ``polygons`` holds the planar facets; ``faces`` holds their triangles,
+    chosen so each facet's narrowest triangle is as wide as possible, which
+    is what SINTEZ AGR Checker's face-plane convexity rule needs.
     """
-    result = hull64.planar_polytope(vertices, OUTPUT_MERGE_DISTANCE)
-    if result is None:
-        return None
-    points, polygons = result
-    faces = hull64.fan_triangles(polygons).astype(np.int32)
+    if simplify:
+        result = hull64.simplify_needles(
+            vertices, OUTPUT_MERGE_DISTANCE, NEEDLE_ASPECT, NEEDLE_MAX_LOSS
+        )
+        if result is None:
+            return None
+        points, polygons, faces = result
+    else:
+        result = hull64.planar_polytope(vertices, OUTPUT_MERGE_DISTANCE)
+        if result is None:
+            return None
+        points, polygons = result
+        faces = hull64.wide_triangles(points, polygons)
+    faces = np.asarray(faces, dtype=np.int32)
     piece = Piece(vertices=points, faces=faces, depth=depth)
     piece.polygons = polygons
     piece.closed = True
@@ -2940,19 +2955,18 @@ def _decompose_with_tolerance(source, settings, seed, thin_limit, tolerance):
             )
         )
 
-    # The output is rebuilt as exact polytopes with planar faces: separating
-    # touching pieces cuts them again with triangulated caps, and needle
-    # triangles are exactly what makes SINTEZ AGR Checker report a convex
-    # hull as concave.
+    # The output is rebuilt as exact polytopes triangulated facet by facet:
+    # separating touching pieces cuts them again, and needle triangles are
+    # exactly what makes SINTEZ AGR Checker report a convex hull as
+    # concave.
     output = []
     for piece in kept:
-        polytope = _polytope_piece(piece.vertices, piece.depth)
+        polytope = _polytope_piece(piece.vertices, piece.depth, simplify=True)
         if polytope is not None:
             output.append(polytope)
     hulls = [(piece.vertices, piece.faces) for piece in output]
     return DecompositionResult(
         hulls=hulls,
-        polygons=[piece.polygons for piece in output],
         max_deviation=tolerance,
         total_triangles=sum(len(faces) for _, faces in hulls),
         seed=seed,

@@ -308,13 +308,7 @@ def _create_collider_collection(
                     float(vertex[2]) - pivot.z,
                 )
                 for vertex in vertices
-            ], [], (
-                # Planar polygons rather than their fan triangles: needle
-                # triangles make SINTEZ AGR Checker read a convex hull as
-                # concave.
-                result.polygons[index - 1]
-                if len(result.polygons) >= index else faces.tolist()
-            ))
+            ], [], faces.tolist())
             mesh.materials.clear()
             mesh.update(calc_edges=True)
 

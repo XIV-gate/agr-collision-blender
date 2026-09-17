@@ -154,18 +154,18 @@ def convex_hull(points):
 
 
 def planar_polytope(points, merge_distance):
-    """Convex hull of ``points`` as planar polygons instead of triangles.
+    """Convex hull of ``points`` as planar facets instead of raw triangles.
 
     Returns ``(vertices, polygons)`` with only the vertices the polygons use,
     or ``None`` when the points span no volume.
 
-    A triangulated hull is full of long needle triangles whose plane is
+    A raw hull triangulation is full of long needle triangles whose plane is
     decided by micrometres of rounding. SINTEZ AGR Checker judges convexity
     against every face plane, and on the reference tower such needles made
     five hulls with a true concavity of 0.03-0.33 mm fail its 10 mm check,
-    because a vertex ten metres away swings across a tilted needle. Here the
-    triangles of one plane are merged into a single polygon, whose normal is
-    taken over all its corners and is stable.
+    because a vertex ten metres away swings across a tilted needle. Merging
+    the triangles of one plane into a facet lets it be triangulated again
+    with wide triangles, see ``wide_triangles``.
 
     Triangles join a facet when all their corners lie within
     ``merge_distance`` of the facet's seed plane, seeded from the largest
@@ -260,6 +260,152 @@ def planar_polytope(points, merge_distance):
     used = sorted({vertex for polygon in polygons for vertex in polygon})
     remap = {old: new for new, old in enumerate(used)}
     return points[used], [[remap[vertex] for vertex in polygon] for polygon in polygons]
+
+
+def facet_width(points, polygon):
+    """Narrowest width of a convex planar polygon.
+
+    For a convex polygon the minimum width is measured across some edge, so
+    it is the smallest, over the edges, of the farthest vertex from that
+    edge's line.
+    """
+    corners = points[polygon]
+    width = np.inf
+    for index in range(len(corners)):
+        start = corners[index]
+        direction = corners[(index + 1) % len(corners)] - start
+        length = float(np.linalg.norm(direction))
+        if length == 0.0:
+            continue
+        across = np.linalg.norm(np.cross(corners - start, direction / length), axis=1)
+        width = min(width, float(across.max()))
+    return 0.0 if width == np.inf else width
+
+
+def _removal_loss(vertices, polygons, corner):
+    """Upper bound on how far the hull retreats when ``corner`` is removed.
+
+    The new hull contains the hull of the corner's neighbours and the
+    polytope's centre, so the distance to that smaller hull can only
+    overstate the loss.
+    """
+    ring = sorted({other for polygon in polygons if corner in polygon for other in polygon} - {corner})
+    local = np.vstack((vertices[ring], vertices.mean(axis=0)[None, :]))
+    triangles = convex_hull(local)
+    if len(triangles) == 0:
+        return np.inf
+    normals = np.cross(
+        local[triangles[:, 1]] - local[triangles[:, 0]],
+        local[triangles[:, 2]] - local[triangles[:, 0]],
+    )
+    probe = vertices[corner]
+    if bool(np.all(normals @ probe - np.einsum("tk,tk->t", normals, local[triangles[:, 0]]) <= 0.0)):
+        return 0.0
+    return float(distance_to_triangles(
+        probe[None, :], local[triangles[:, 0]], local[triangles[:, 1]], local[triangles[:, 2]]
+    )[0])
+
+
+def simplify_needles(points, merge_distance, needle_aspect, max_loss, max_removals=64):
+    """Remove the corners that force needle triangles into the hull.
+
+    Returns ``(vertices, polygons, triangles)`` or ``None``.
+
+    SINTEZ AGR Checker tests every triangle's plane against all other
+    vertices. A triangle much narrower than its hull is long has a plane
+    decided by float32 rounding, and far vertices land millimetres across
+    it. On the reference tower almost all such needles sat inside wide
+    facets, forced by corners that lie nearly on the line between their
+    neighbours; no triangulation of such a facet avoids them. Removing the
+    corner does, and a corner is only removed when the hull retreats from
+    it by at most ``max_loss``. Removal only shrinks the hull, so no gap or
+    overlap can get worse.
+
+    A triangle is a needle when the hull's diameter exceeds its width
+    ``needle_aspect`` times.
+    """
+    result = planar_polytope(points, merge_distance)
+    for _removal in range(max_removals + 1):
+        if result is None:
+            return None
+        vertices, polygons = result
+        triangles = wide_triangles(vertices, polygons)
+        if len(vertices) <= 4 or _removal == max_removals:
+            return vertices, polygons, triangles
+        diameter = float(np.linalg.norm(np.ptp(vertices, axis=0)))
+        needles = [
+            triangle for triangle in triangles.tolist()
+            if _triangle_width(*vertices[triangle]) * needle_aspect < diameter
+        ]
+        if not needles:
+            return vertices, polygons, triangles
+        candidates = sorted({corner for triangle in needles for corner in triangle})
+        losses = [(_removal_loss(vertices, polygons, corner), corner) for corner in candidates]
+        best_loss, best_corner = min(losses)
+        if best_loss > max_loss:
+            return vertices, polygons, triangles
+        simplified = planar_polytope(np.delete(vertices, best_corner, axis=0), merge_distance)
+        if simplified is None:
+            return vertices, polygons, triangles
+        result = simplified
+    return None
+
+
+def _triangle_width(a, b, c):
+    """Height of a triangle over its longest edge."""
+    longest = max(np.linalg.norm(b - a), np.linalg.norm(c - b), np.linalg.norm(a - c))
+    if longest == 0.0:
+        return 0.0
+    return float(np.linalg.norm(np.cross(b - a, c - a))) / longest
+
+
+def wide_triangles(points, polygons):
+    """Triangulate convex polygons so their narrowest triangle is widest.
+
+    SINTEZ AGR Checker tests every triangle's plane against all other
+    vertices. A narrow triangle's plane is set by micrometres of float32
+    rounding, and a vertex metres away lands millimetres across it, so the
+    triangulation that keeps each polygon's narrowest triangle as wide as
+    possible is the one least likely to be misjudged. A fan from one corner
+    is the opposite: on a long strip every triangle is a needle.
+
+    Exact interval dynamic programming over each convex polygon.
+    """
+    rows = []
+    for polygon in polygons:
+        count = len(polygon)
+        if count == 3:
+            rows.append(tuple(polygon))
+            continue
+        corners = points[polygon]
+        best = [[np.inf] * count for _ in range(count)]
+        split = [[-1] * count for _ in range(count)]
+        for span in range(2, count):
+            for first in range(count - span):
+                last = first + span
+                best_value = -1.0
+                best_split = first + 1
+                for middle in range(first + 1, last):
+                    value = min(
+                        best[first][middle],
+                        best[middle][last],
+                        _triangle_width(corners[first], corners[middle], corners[last]),
+                    )
+                    if value > best_value:
+                        best_value = value
+                        best_split = middle
+                best[first][last] = best_value
+                split[first][last] = best_split
+        stack = [(0, count - 1)]
+        while stack:
+            first, last = stack.pop()
+            if last - first < 2:
+                continue
+            middle = split[first][last]
+            rows.append((polygon[first], polygon[middle], polygon[last]))
+            stack.append((first, middle))
+            stack.append((middle, last))
+    return np.asarray(rows, dtype=np.int64).reshape((-1, 3))
 
 
 def fan_triangles(polygons):
