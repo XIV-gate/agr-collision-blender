@@ -25,3 +25,7 @@ __pycache__/
 *.tmp
 .pytest_cache/
 releases/
+
+# Local test meshes and session notes for tools/dev are not distributed.
+tools/dev/*.npz
+tools/dev/HANDOFF.md

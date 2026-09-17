@@ -5,6 +5,7 @@
 import ctypes
 import datetime
 import json
+import math
 import os
 import sys
 import threading
@@ -15,6 +16,7 @@ import bpy
 from mathutils import Vector
 
 from .core import decompose
+from .core import inspection
 from .core import naming
 from .core import source
 from .core import validation
@@ -319,8 +321,7 @@ def _create_collider_collection(
                 source_data.object_names,
                 ensure_ascii=False,
             )
-            ob["agr_tolerance"] = settings.tolerance
-            ob["agr_seed"] = result.seed
+            ob["agr_feature_tolerance"] = result.feature_tolerance
             ob.display_type = "WIRE" if settings.wire_display else "SOLID"
             ob.color = (0.12, 0.65, 1.0, 1.0)
             created.append(ob)
@@ -422,11 +423,13 @@ def generate_for_objects(
         origin_world=pivot,
     )
     try:
-        progress(88, "Validating convexity, closure, intersections and names")
+        progress(88, "Validating convexity, closure, intersections, gaps and names")
         report = validation.validate_colliders(
             colliders,
             expected_base=source_data.name,
             triangle_budget=budget,
+            checker_tolerances=validation.agr_checker_tolerances(context.scene),
+            model_polygons=source_data.raw_triangles,
         )
         if not report.valid:
             raise RuntimeError(report.errors[0])
@@ -435,6 +438,11 @@ def generate_for_objects(
         raise
     _commit_collider_swap(collection, source_data.name, transaction)
     progress(98, "Committing validated UCX set atomically")
+    scene_settings = getattr(context.scene, "xivgate_agr_collision", None)
+    if scene_settings is not None:
+        # The debugger checks the set that was generated last unless the
+        # user points it somewhere else.
+        scene_settings.debug_collection = collection
 
     settings.last_source = source_data.name
     settings.last_colliders = len(result.hulls)
@@ -660,6 +668,8 @@ class AGR_OT_validate(bpy.types.Operator):
             colliders,
             expected_base=base,
             triangle_budget=budget,
+            checker_tolerances=validation.agr_checker_tolerances(context.scene),
+            model_polygons=source_triangles or None,
         )
         settings.last_colliders = report.collider_count
         settings.last_triangles = report.triangle_count
@@ -711,6 +721,204 @@ class AGR_OT_remove_generated(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def debug_targets(settings):
+    """Mesh objects of the debugger collection, including nested collections."""
+    collection = settings.debug_collection
+    if collection is None:
+        return []
+    return sorted(
+        (
+            ob for ob in collection.all_objects
+            if ob.type == "MESH"
+            and (not settings.debug_colliders_only or naming.is_any_collider(ob))
+        ),
+        key=lambda ob: ob.name,
+    )
+
+
+def _select_only(context, objects):
+    """Replace the selection with ``objects``; the first becomes active.
+
+    Objects hidden in the viewport or outside the view layer cannot be
+    selected; they are counted and left alone rather than unhidden.
+    """
+    view_layer = context.view_layer
+    for ob in view_layer.objects:
+        if ob.select_get(view_layer=view_layer):
+            ob.select_set(False, view_layer=view_layer)
+    selected = []
+    unreachable = 0
+    for ob in objects:
+        if (
+            view_layer.objects.get(ob.name) is not ob
+            or not ob.visible_get(view_layer=view_layer)
+        ):
+            unreachable += 1
+            continue
+        ob.select_set(True, view_layer=view_layer)
+        selected.append(ob)
+    if selected:
+        view_layer.objects.active = selected[0]
+    return selected, unreachable
+
+
+class _DebugOperator:
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.xivgate_agr_collision
+        return settings.debug_collection is not None and context.mode == "OBJECT"
+
+    def finish(self, context, found, total, summary):
+        settings = context.scene.xivgate_agr_collision
+        selected, unreachable = _select_only(context, [ob for ob, _value in found])
+        if not total:
+            status = translations.iface("No mesh objects to check")
+        elif not found:
+            status = summary["none"].format(total)
+        else:
+            worst_ob, worst_value = found[0]
+            status = summary["found"].format(
+                len(found), total, summary["value"](worst_value), worst_ob.name
+            )
+            if unreachable:
+                status += translations.iface(" ({} hidden, not selected)").format(
+                    unreachable
+                )
+        settings.debug_status = status
+        self.report({"INFO"}, status)
+        for ob, value in found[:50]:
+            print("AGR debugger: {:<40} {}".format(ob.name, summary["value"](value)))
+        return {"FINISHED"}
+
+
+def _millimetres(value):
+    return translations.iface("{:.4f} mm").format(value * 1000.0)
+
+
+def _cubic_metres(value):
+    return translations.iface("{:.6f} m3").format(value)
+
+
+class AGR_OT_debug_concave(_DebugOperator, bpy.types.Operator):
+    bl_idname = "xivgate_agr_collision.debug_concave"
+    bl_label = "Select Concave Hulls"
+    bl_description = (
+        "Select objects whose surface sinks below their own convex hull, "
+        "including open meshes; the deepest one becomes active"
+    )
+
+    def execute(self, context):
+        settings = context.scene.xivgate_agr_collision
+        targets = debug_targets(settings)
+        found = []
+        for ob in targets:
+            report = inspection.inspect_object(
+                ob, settings.debug_concavity_tolerance, measure=("concavity",)
+            )
+            if not report.closed:
+                # An open mesh has no inside; it can never be a valid hull.
+                found.append((ob, math.inf))
+            elif report.concavity > 0.0:
+                found.append((ob, report.concavity))
+        found.sort(key=lambda item: -item[1])
+        return self.finish(context, found, len(targets), {
+            "none": translations.iface("No concave objects among {}"),
+            "found": translations.iface("Concave: {} of {}; deepest {} in {}"),
+            "value": lambda value: (
+                translations.iface("open mesh") if value == math.inf else _millimetres(value)
+            ),
+        })
+
+
+class AGR_OT_debug_small(_DebugOperator, bpy.types.Operator):
+    bl_idname = "xivgate_agr_collision.debug_small"
+    bl_label = "Select Small Parts"
+    bl_description = (
+        "Select objects whose enclosed volume is below the threshold; the "
+        "smallest one becomes active"
+    )
+
+    def execute(self, context):
+        settings = context.scene.xivgate_agr_collision
+        targets = debug_targets(settings)
+        found = []
+        for ob in targets:
+            report = inspection.inspect_object(ob, measure=("volume",))
+            if report.volume < settings.debug_min_volume:
+                found.append((ob, report.volume))
+        found.sort(key=lambda item: item[1])
+        return self.finish(context, found, len(targets), {
+            "none": translations.iface("No small objects among {}"),
+            "found": translations.iface("Small: {} of {}; smallest {} in {}"),
+            "value": _cubic_metres,
+        })
+
+
+class AGR_OT_debug_thin(_DebugOperator, bpy.types.Operator):
+    bl_idname = "xivgate_agr_collision.debug_thin"
+    bl_label = "Select Thin Parts"
+    bl_description = (
+        "Select objects whose exact minimum thickness is below the threshold; "
+        "the thinnest one becomes active"
+    )
+
+    def execute(self, context):
+        settings = context.scene.xivgate_agr_collision
+        targets = debug_targets(settings)
+        found = []
+        for ob in targets:
+            report = inspection.inspect_object(ob, measure=("thickness",))
+            if report.thickness < settings.debug_min_thickness:
+                found.append((ob, report.thickness))
+        found.sort(key=lambda item: item[1])
+        return self.finish(context, found, len(targets), {
+            "none": translations.iface("No thin objects among {}"),
+            "found": translations.iface("Thin: {} of {}; thinnest {} in {}"),
+            "value": _millimetres,
+        })
+
+
+class AGR_OT_debug_agr_checker(_DebugOperator, bpy.types.Operator):
+    bl_idname = "xivgate_agr_collision.debug_agr_checker"
+    bl_label = "Select SINTEZ Checker Failures"
+    bl_description = (
+        "Select objects SINTEZ AGR Checker would reject: open, non-manifold, "
+        "non-convex by its face-plane rule, intersecting, closer than its gap "
+        "tolerance, with UV maps, materials, non-triangle polygons or a "
+        "repeated number; numbering gaps and the polygon limit are reported"
+    )
+
+    def execute(self, context):
+        settings = context.scene.xivgate_agr_collision
+        targets = debug_targets(settings)
+        convex_tolerance, gap_tolerance = validation.agr_checker_tolerances(context.scene)
+        report = validation.agr_checker_report(
+            targets,
+            convex_tolerance,
+            gap_tolerance,
+            model_polygons=settings.last_input_triangles or None,
+        )
+        by_name = {ob.name: ob for ob in targets}
+        found = [(by_name[name], 0.0) for name in report.failing_names]
+        status = self.finish(context, found, len(targets), {
+            "none": translations.iface("SINTEZ checker passes all {}"),
+            "found": translations.iface("SINTEZ checker rejects {} of {}; first {}{}"),
+            "value": lambda _value: "",
+        })
+        if found:
+            settings.debug_status = "{} - {}".format(
+                translations.iface("SINTEZ checker rejects {} of {}").format(
+                    len(found), len(targets)
+                ),
+                report.summary(),
+            )
+            print("AGR debugger: SINTEZ rules at convexity {:.1f} mm, gap {:.1f} mm: {}".format(
+                convex_tolerance * 1000.0, gap_tolerance * 1000.0, report.summary()))
+        return status
+
+
 CLASSES = (
     AGR_OT_analyze_selected,
     AGR_OT_generate,
@@ -718,6 +926,10 @@ CLASSES = (
     AGR_OT_toggle_source_visibility,
     AGR_OT_validate,
     AGR_OT_remove_generated,
+    AGR_OT_debug_concave,
+    AGR_OT_debug_small,
+    AGR_OT_debug_thin,
+    AGR_OT_debug_agr_checker,
 )
 
 

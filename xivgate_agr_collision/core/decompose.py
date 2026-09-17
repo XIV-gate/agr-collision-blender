@@ -1,27 +1,84 @@
 # SPDX-FileCopyrightText: 2026 XIVgate
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Exact concave-edge BSP decomposition.
+# Exact convex decomposition by planar cuts along reflex edges.
 #
-# Closed source components are cut along planes derived from their own
-# concave edges. Exterior faces are never replaced by a sampled approximation:
-# every final exterior polygon is inherited from the repaired source, while
-# newly created polygons are internal cut caps. This preserves architectural
-# corners, openings and steps.
+# A closed source component is split only by planes that contain one of its
+# reflex (concave) edges and continue a neighbouring source facet. Every cut
+# is exact: both halves share one triangulated cap and the parent volume is
+# conserved to floating-point precision. A convex hull never replaces a
+# concave region, so openings, niches and steps of the source are preserved.
+# Only parts thinner than the thin-part threshold are ignored.
 
 from dataclasses import dataclass, field
+import itertools
 import math
-import random
 
 import bmesh
 import numpy as np
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
+from . import hull64
 
-CONCAVE_EPSILON = math.radians(0.25)
-PLANE_KEY_EPSILON = 1.0e-5
-CONVEX_VOLUME_ABSOLUTE_EPSILON = 1.0e-7
-CONVEX_VOLUME_RELATIVE_EPSILON = 1.0e-7
+
+MAX_PARTS = 999
+# Leaves may exceed the final limit before exact neighbours are merged again.
+LEAF_LIMIT = MAX_PARTS * 4
+# Vertices this close to a cutting plane lie on it: half of the minimum AGR
+# gap, and above the float32 noise of long source faces.
+PLANE_EPSILON = 1.0e-4
+# Triangles join one planar facet only when all their vertices lie this close
+# to its plane, so a facet used as a cutting plane is always classified on it.
+FACET_EPSILON = 5.0e-5
+# A facet plane is a support plane of its piece when no vertex lies further
+# than this in front of it. Float32 source coordinates tilt long facade faces
+# by up to about this much.
+REFLEX_EPSILON = 1.0e-3
+CONVEX_DEPTH_EPSILON = 1.0e-3
+# Depth a piece may deviate from convexity and still count as convex. A run
+# raises it to the automatic feature tolerance; numeric support-plane and
+# containment tests keep REFLEX_EPSILON.
+_feature_tolerance = CONVEX_DEPTH_EPSILON
+# Facets smaller than this carry no reliable plane orientation.
+MIN_FACET_SIZE = 1.0e-2
+# Coordinate noise used to widen the support tolerance of small facets.
+COORDINATE_NOISE = 2.0e-5
+# A merge may add at most this hull volume per square metre of hull surface.
+MERGE_FILM_EPSILON = 3.0e-5
+# A candidate plane must leave at least this much material on both sides.
+GRAZING_EPSILON = 1.0e-3
+VOLUME_RELATIVE_EPSILON = 1.0e-7
+VOLUME_ABSOLUTE_EPSILON = 1.0e-9
+# Default thickness below which a part of the source is ignored.
+THIN_PART_DEFAULT = 0.05
+MAX_CUT_ATTEMPTS = 32
+# Cuts actually tried per split; the one leaving the least concavity wins.
+CUT_LOOKAHEAD = 12
+# Alternative cuts tried per node during the refinement search.
+REFINEMENT_TRIES = 3
+# How far down its ranked planes the variant search walks one node.
+SEARCH_MAX_SKIP = 24
+# Largest share of the model's cutting work one re-cut node may carry.
+SEARCH_WORK_SHARE = 0.25
+# Real variants such a node may try before it is retired.
+SEARCH_HEAVY_VARIANTS = 1
+# Hull triangles are merged into one planar facet when their corners lie this
+# close to a common plane. Measured on the reference tower against the
+# SINTEZ AGR Checker rule after float32 rounding: 10 um left facets bent
+# enough to tilt their triangles, 0.1 um and below brought needles back.
+OUTPUT_MERGE_DISTANCE = 1.0e-6
+# Output triangles whose hull is more than NEEDLE_ASPECT times longer than
+# they are wide are removed by dropping a corner, as long as the hull retreats
+# by at most NEEDLE_MAX_LOSS. Such a triangle has a plane decided by float32
+# rounding, which SINTEZ AGR Checker misreads.
+NEEDLE_ASPECT = 100.0
+NEEDLE_MAX_LOSS = 0.005
+# Up to this many face planes the gap inset intersects every plane triple;
+# above it only planes of neighbouring faces.
+INSET_GLOBAL_PLANES = 48
+# Automatic depth tolerance for shallow steps, as a share of the thin-part
+# threshold: 0.4 of 5 cm lets a hull bridge steps and recesses up to 2 cm.
+FEATURE_TOLERANCE_RATIO = 0.4
 
 
 @dataclass(eq=False)
@@ -32,29 +89,16 @@ class Piece:
     closed: bool = False
     volume: float = 0.0
     concave_edges: int = 0
-    concavity_volume: float = math.inf
+    concavity_depth: float = math.inf
     unsplittable: bool = False
-    approximate_open_shell: bool = False
-    allow_tolerance_hull: bool = False
-    approximation_deviation: float = 0.0
-    relaxed_splits: int = 0
 
     @property
     def convex(self):
-        if not self.closed:
-            return False
-        if self.concave_edges == 0:
-            return True
-
-        # Plane cuts can leave a nearly coplanar diagonal with a tiny negative
-        # signed angle. The convex-hull volume difference is a more stable
-        # secondary test and prevents subdivision from chasing floating-point
-        # noise into the Max Parts limit.
-        volume_epsilon = max(
-            CONVEX_VOLUME_ABSOLUTE_EPSILON,
-            self.volume * CONVEX_VOLUME_RELATIVE_EPSILON,
+        return (
+            self.closed
+            and self.concave_edges == 0
+            and self.concavity_depth <= _feature_tolerance
         )
-        return self.concavity_volume <= volume_epsilon
 
 
 @dataclass
@@ -66,6 +110,131 @@ class DecompositionResult:
     warnings: list[str] = field(default_factory=list)
     complete: bool = True
     remaining_invalid: int = 0
+    ignored_parts: list = field(default_factory=list)
+    failed_parts: list = field(default_factory=list)
+    feature_tolerance: float = 0.0
+
+
+# --------------------------------------------------------------------------
+# Mesh topology
+# --------------------------------------------------------------------------
+
+@dataclass
+class _Topology:
+    start: np.ndarray        # directed edge start vertex, 3 per face
+    end: np.ndarray          # directed edge end vertex
+    opposite: np.ndarray     # vertex opposite the directed edge in its face
+    face: np.ndarray         # face owning the directed edge
+    first: np.ndarray        # directed edge index of each manifold edge
+    second: np.ndarray       # its twin with reversed direction
+    boundary_edges: int
+    nonmanifold_edges: int
+    misoriented_edges: int
+
+    @property
+    def closed(self):
+        return (
+            len(self.first) > 0
+            and self.boundary_edges == 0
+            and self.nonmanifold_edges == 0
+            and self.misoriented_edges == 0
+        )
+
+
+def _topology(vertex_count, faces):
+    faces = np.asarray(faces, dtype=np.int64).reshape((-1, 3))
+    start = faces[:, [0, 1, 2]].reshape(-1)
+    end = faces[:, [1, 2, 0]].reshape(-1)
+    opposite = faces[:, [2, 0, 1]].reshape(-1)
+    face = np.repeat(np.arange(len(faces)), 3)
+    if len(start) == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return _Topology(start, end, opposite, face, empty, empty, 0, 0, 0)
+    low = np.minimum(start, end)
+    high = np.maximum(start, end)
+    key = low * max(int(vertex_count), 1) + high
+    order = np.argsort(key, kind="stable")
+    sorted_key = key[order]
+    group_start = np.flatnonzero(
+        np.r_[True, sorted_key[1:] != sorted_key[:-1]]
+    )
+    counts = np.diff(np.r_[group_start, len(sorted_key)])
+    pairs = group_start[counts == 2]
+    first = order[pairs]
+    second = order[pairs + 1]
+    misoriented = int(np.count_nonzero(start[first] != end[second]))
+    return _Topology(
+        start=start,
+        end=end,
+        opposite=opposite,
+        face=face,
+        first=first,
+        second=second,
+        boundary_edges=int(np.count_nonzero(counts == 1)),
+        nonmanifold_edges=int(np.count_nonzero(counts > 2)),
+        misoriented_edges=misoriented,
+    )
+
+
+def _face_normals(vertices, faces):
+    a = vertices[faces[:, 0]]
+    cross = np.cross(vertices[faces[:, 1]] - a, vertices[faces[:, 2]] - a)
+    area2 = np.linalg.norm(cross, axis=1)
+    normals = np.zeros_like(cross)
+    valid = area2 > 1.0e-15
+    normals[valid] = cross[valid] / area2[valid, None]
+    return normals, area2 * 0.5
+
+
+def _signed_volume(vertices, faces):
+    if len(faces) == 0:
+        return 0.0
+    a = vertices[faces[:, 0]]
+    b = vertices[faces[:, 1]]
+    c = vertices[faces[:, 2]]
+    return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
+
+
+def _edge_fold_depths(vertices, topology, normals):
+    """Signed fold of every manifold edge; positive values are reflex.
+
+    Each neighbour's far vertex is measured against the other face plane and
+    the smaller value is kept. A sliver triangle has an unreliable normal, but
+    its own far vertex is always close to the shared edge, so the minimum stays
+    geometrically meaningful.
+    """
+    first = topology.first
+    second = topology.second
+    origin = vertices[topology.start[first]]
+    far_first = vertices[topology.opposite[first]]
+    far_second = vertices[topology.opposite[second]]
+    depth_a = np.einsum(
+        "ij,ij->i",
+        normals[topology.face[first]],
+        far_second - origin,
+    )
+    depth_b = np.einsum(
+        "ij,ij->i",
+        normals[topology.face[second]],
+        far_first - origin,
+    )
+    return np.minimum(depth_a, depth_b)
+
+
+def _compact(vertices, faces):
+    faces = np.asarray(faces, dtype=np.int64).reshape((-1, 3))
+    if len(faces) == 0:
+        return (
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.int32),
+        )
+    used = np.unique(faces.reshape(-1))
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return (
+        np.asarray(vertices, dtype=np.float64)[used].copy(),
+        remap[faces].astype(np.int32),
+    )
 
 
 def _new_bmesh(vertices, faces):
@@ -76,154 +245,1850 @@ def _new_bmesh(vertices, faces):
             bm.faces.new([bm_vertices[int(index)] for index in triangle])
         except ValueError:
             pass
-    if bm.faces:
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
-        if (
-            bm.edges
-            and all(edge.is_manifold for edge in bm.edges)
-            and float(bm.calc_volume(signed=True)) < 0.0
-        ):
-            bmesh.ops.reverse_faces(bm, faces=bm.faces[:])
     return bm
 
 
-def _bmesh_arrays(bm, simplify=True):
-    if simplify and bm.faces:
-        bmesh.ops.dissolve_limit(
-            bm,
-            angle_limit=math.radians(0.05),
-            use_dissolve_boundaries=True,
-            verts=bm.verts[:],
-            edges=bm.edges[:],
-            delimit=set(),
-        )
-    if bm.faces:
-        bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
-        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+def _orient_outward(vertices, faces):
+    """Return faces with consistent outward winding, or None if impossible."""
+    topology = _topology(len(vertices), faces)
+    if topology.boundary_edges or topology.nonmanifold_edges:
+        return None
+    if topology.misoriented_edges:
+        bm = _new_bmesh(vertices, faces)
+        try:
+            if len(bm.faces) != len(faces):
+                return None
+            bmesh.ops.recalc_face_normals(bm, faces=bm.faces[:])
+            bm.verts.index_update()
+            faces = np.asarray(
+                [[vertex.index for vertex in face.verts] for face in bm.faces],
+                dtype=np.int32,
+            )
+        finally:
+            bm.free()
+    if _signed_volume(vertices, faces) < 0.0:
+        faces = faces[:, ::-1].copy()
+    return faces
 
-    used_vertices = [vertex for vertex in bm.verts if vertex.link_faces]
-    if len(used_vertices) < 3 or not bm.faces:
-        return (
-            np.empty((0, 3), dtype=np.float64),
-            np.empty((0, 3), dtype=np.int32),
-        )
-    vertex_indices = {vertex: index for index, vertex in enumerate(used_vertices)}
-    vertices = np.asarray(
-        [tuple(vertex.co) for vertex in used_vertices],
-        dtype=np.float64,
-    )
+
+# --------------------------------------------------------------------------
+# Convex hulls and piece analysis
+# --------------------------------------------------------------------------
+
+def _bmesh_triangles(bm):
+    used = [vertex for vertex in bm.verts if vertex.link_faces]
+    if len(used) < 4 or not bm.faces:
+        return None
+    index = {vertex: position for position, vertex in enumerate(used)}
+    vertices = np.asarray([tuple(vertex.co) for vertex in used], dtype=np.float64)
     faces = np.asarray(
-        [
-            [vertex_indices[vertex] for vertex in face.verts]
-            for face in bm.faces
-        ],
+        [[index[vertex] for vertex in face.verts] for face in bm.faces],
         dtype=np.int32,
     )
     return vertices, faces
 
 
-def _analyse_piece(piece):
-    bm = _new_bmesh(piece.vertices, piece.faces)
+def _convex_hull(vertices, simplify=True):
+    unique = np.unique(np.round(np.asarray(vertices, dtype=np.float64), 9), axis=0)
+    if len(unique) < 4:
+        return None
+    # BMesh stores float32 coordinates; hull in local space to keep precision.
+    origin = unique.mean(axis=0)
+    bm = bmesh.new()
     try:
+        bm_vertices = [bm.verts.new(tuple(point - origin)) for point in unique]
+        result = bmesh.ops.convex_hull(
+            bm,
+            input=bm_vertices,
+            use_existing_faces=False,
+        )
+        unused = [
+            vertex
+            for vertex in result.get("geom_unused", ())
+            if isinstance(vertex, bmesh.types.BMVert)
+        ]
+        interior = [
+            vertex
+            for vertex in result.get("geom_interior", ())
+            if isinstance(vertex, bmesh.types.BMVert)
+        ]
+        stray = list({vertex for vertex in unused + interior if not vertex.link_faces})
+        if stray:
+            bmesh.ops.delete(bm, geom=stray, context="VERTS")
         if not bm.faces:
-            piece.unsplittable = True
-            return piece
-        piece.closed = bool(bm.edges) and all(edge.is_manifold for edge in bm.edges)
-        piece.volume = abs(float(bm.calc_volume(signed=True)))
-        if piece.closed:
-            piece.concave_edges = sum(
-                edge.calc_face_angle_signed() < -CONCAVE_EPSILON
-                for edge in bm.edges
-                if edge.is_manifold
+            return None
+        if simplify:
+            bmesh.ops.dissolve_limit(
+                bm,
+                angle_limit=1.0e-5,
+                use_dissolve_boundaries=False,
+                verts=bm.verts[:],
+                edges=bm.edges[:],
+                delimit=set(),
             )
-            hull = _convex_hull(piece.vertices)
-            if hull is None:
-                piece.concavity_volume = math.inf
-            else:
-                hull_bm = _new_bmesh(*hull)
-                try:
-                    hull_volume = abs(float(hull_bm.calc_volume(signed=True)))
-                finally:
-                    hull_bm.free()
-                piece.concavity_volume = max(0.0, hull_volume - piece.volume)
-        else:
-            piece.concave_edges = 0
-            piece.concavity_volume = math.inf
-        return piece
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        arrays = _bmesh_triangles(bm)
+        if arrays is None:
+            return None
+        hull_vertices, hull_faces = arrays
+        hull_vertices = hull_vertices + origin
+        hull_faces = _orient_outward(hull_vertices, hull_faces)
+        if hull_faces is None or len(hull_faces) < 4:
+            return None
+        return hull_vertices, hull_faces
     finally:
         bm.free()
 
 
-def _component_face_groups(vertex_count, faces):
-    parent = np.arange(vertex_count, dtype=np.int32)
+def _surface_bvh(vertices, faces):
+    return BVHTree.FromPolygons(
+        [Vector(tuple(point)) for point in vertices],
+        [tuple(int(index) for index in triangle) for triangle in faces],
+        all_triangles=True,
+        epsilon=0.0,
+    )
+
+
+def _analyse_piece(piece):
+    vertices = np.asarray(piece.vertices, dtype=np.float64)
+    piece.vertices = vertices
+    if len(piece.faces) == 0 or len(vertices) < 4:
+        piece.closed = False
+        piece.volume = 0.0
+        piece.concave_edges = 0
+        piece.concavity_depth = math.inf
+        piece.unsplittable = True
+        return piece
+    faces = _orient_outward(vertices, piece.faces)
+    if faces is None:
+        piece.faces = np.asarray(piece.faces, dtype=np.int32)
+        piece.closed = False
+        piece.volume = abs(_signed_volume(vertices, piece.faces))
+        piece.concave_edges = 0
+        piece.concavity_depth = math.inf
+        return piece
+    piece.faces = np.asarray(faces, dtype=np.int32)
+    piece.closed = True
+    piece.volume = _signed_volume(vertices, piece.faces)
+    # A closed polyhedron is convex exactly when every facet plane supports
+    # it. This test cannot be fooled by sliver triangles hiding a crease.
+    topology = _topology(len(vertices), piece.faces)
+    normals, offsets, areas, tolerances, centroids = _piece_planes(
+        vertices, piece.faces, topology
+    )
+    if len(normals) == 0:
+        piece.concave_edges = 0
+        piece.concavity_depth = 0.0
+        piece.violated_planes = None
+        return piece
+    piece.facet_planes = (normals, offsets, areas, tolerances, centroids)
+    violation = (vertices @ normals.T - offsets).max(axis=0)
+    violated = violation > tolerances
+    piece.concave_edges = int(np.count_nonzero(violated))
+    piece.concavity_depth = (
+        float(violation[violated].max()) if piece.concave_edges else 0.0
+    )
+    piece.violated_planes = (
+        normals[violated],
+        offsets[violated],
+        areas[violated],
+        tolerances[violated],
+        centroids[violated],
+    )
+    if piece.concave_edges:
+        return piece
+
+    # Facets fragmented into slivers by earlier cuts may not form a reliable
+    # plane. Every vertex of a convex piece lies on its hull, so a vertex
+    # below the hull reveals such a hidden recess.
+    hull = _convex_hull(vertices, simplify=False)
+    if hull is None:
+        return piece
+    hull_planes = _convex_planes(Piece(vertices=hull[0], faces=hull[1]))
+    if not hull_planes:
+        return piece
+    hull_normals = np.asarray([normal for _point, normal in hull_planes])
+    hull_offsets = np.asarray([float(normal @ point) for point, normal in hull_planes])
+    depth = (hull_offsets[None, :] - vertices @ hull_normals.T).min(axis=1)
+    deep = np.flatnonzero(depth > _feature_tolerance)
+    if len(deep) == 0:
+        return piece
+    piece.concavity_depth = float(depth[deep].max())
+    deep = deep[np.argsort(-depth[deep])][:32]
+    # Facets that run through the deepest vertices describe the recess; their
+    # planes are the architectural cuts, unlike single sliver triangles.
+    through = np.abs(
+        vertices[deep] @ normals.T - offsets
+    ).min(axis=0) <= REFLEX_EPSILON * 2.0
+    if through.any():
+        piece.concave_edges = int(np.count_nonzero(through))
+        piece.violated_planes = (
+            normals[through],
+            offsets[through],
+            areas[through],
+            tolerances[through],
+            centroids[through],
+        )
+        return piece
+
+    incident = np.flatnonzero(np.isin(piece.faces, deep).any(axis=1))
+    face_normals, face_areas = _face_normals(vertices, piece.faces[incident])
+    found = {}
+    for index, face in enumerate(incident):
+        if face_areas[index] <= 1.0e-10:
+            continue
+        unit = face_normals[index]
+        offset = float(unit @ vertices[piece.faces[face, 0]])
+        key = (*np.round(unit * 1.0e3).astype(np.int64).tolist(), int(round(offset * 1.0e3)))
+        if key in found:
+            found[key][2] += float(face_areas[index])
+        else:
+            found[key] = [
+                unit,
+                offset,
+                float(face_areas[index]),
+                vertices[piece.faces[face]].mean(axis=0),
+            ]
+    if not found:
+        return piece
+    rows = list(found.values())
+    piece.concave_edges = len(rows)
+    piece.violated_planes = (
+        np.asarray([row[0] for row in rows]),
+        np.asarray([row[1] for row in rows]),
+        np.asarray([row[2] for row in rows]),
+        np.full(len(rows), _feature_tolerance),
+        np.asarray([row[3] for row in rows]),
+    )
+    return piece
+
+
+def _piece_planes(vertices, faces, topology=None):
+    """Planar facets of a closed piece: normals, offsets, areas, tolerances.
+
+    Facets grow from the largest triangles, whose normals are reliable.
+    Neighbours join by vertex distance to the seed plane, so sliver triangles
+    left along cut lines belong to the facet they lie in instead of hiding it.
+    """
+    faces = np.asarray(faces, dtype=np.int64)
+    if topology is None:
+        topology = _topology(len(vertices), faces)
+    normals, areas = _face_normals(vertices, faces)
+    corners = vertices[faces]
+    longest = np.max(
+        np.stack((
+            np.linalg.norm(corners[:, 1] - corners[:, 0], axis=1),
+            np.linalg.norm(corners[:, 2] - corners[:, 1], axis=1),
+            np.linalg.norm(corners[:, 0] - corners[:, 2], axis=1),
+        )),
+        axis=0,
+    )
+    heights = 2.0 * areas / np.maximum(longest, 1.0e-12)
+    # Face adjacency as one sorted array pair, so the region growing below
+    # only slices it instead of walking Python lists.
+    left_faces = topology.face[topology.first]
+    right_faces = topology.face[topology.second]
+    owners = np.concatenate((left_faces, right_faces))
+    others = np.concatenate((right_faces, left_faces))
+    order = np.argsort(owners, kind="stable")
+    owners = owners[order]
+    others = others[order]
+    starts = np.searchsorted(owners, np.arange(len(faces) + 1))
+    # The walk below reads neighbours one face at a time, so the adjacency is
+    # handed to it as plain lists; slicing a numpy array per face cost more
+    # than the lookup itself.
+    others_list = others.tolist()
+    starts_list = starts.tolist()
+    neighbours = [
+        others_list[starts_list[face]:starts_list[face + 1]]
+        for face in range(len(faces))
+    ]
+
+    diameter = max(float(np.ptp(vertices, axis=0).max()), MIN_FACET_SIZE)
+    assigned = np.zeros(len(faces), dtype=bool)
+    rows = []
+    for seed in np.argsort(-areas, kind="stable"):
+        if assigned[seed]:
+            continue
+        if heights[seed] < MIN_FACET_SIZE:
+            continue
+        unit = normals[seed]
+        offset = float(unit @ corners[seed, 0])
+        # Every face is tested against this plane once, vectorised, instead
+        # of three numpy calls per face inside the walk below. On small
+        # fragments the call overhead of those tiny operations dominated the
+        # arithmetic, and this function is a third of the whole run.
+        on_plane = np.all(
+            np.abs(corners @ unit - offset) <= FACET_EPSILON, axis=1
+        ).tolist()
+        members = [int(seed)]
+        assigned[seed] = True
+        stack = [int(seed)]
+        while stack:
+            face = stack.pop()
+            for other in neighbours[face]:
+                if assigned[other] or not on_plane[other]:
+                    continue
+                assigned[other] = True
+                members.append(other)
+                stack.append(other)
+        members = np.asarray(members)
+        weighted = (normals[members] * areas[members, None]).sum(axis=0)
+        norm = float(np.linalg.norm(weighted))
+        if norm > 1.0e-15:
+            unit = weighted / norm
+        points = vertices[np.unique(faces[members].reshape(-1))]
+        offset = float(np.median(points @ unit))
+        size = max(float(np.ptp(points, axis=0).max()), float(heights[seed]))
+        tolerance = _feature_tolerance + min(
+            COORDINATE_NOISE * diameter / size, REFLEX_EPSILON
+        )
+        rows.append((
+            unit,
+            offset,
+            float(areas[members].sum()),
+            tolerance,
+            points.mean(axis=0),
+        ))
+    if not rows:
+        return (
+            np.empty((0, 3)), np.empty(0), np.empty(0), np.empty(0),
+            np.empty((0, 3)),
+        )
+    return (
+        np.asarray([row[0] for row in rows]),
+        np.asarray([row[1] for row in rows]),
+        np.asarray([row[2] for row in rows]),
+        np.asarray([row[3] for row in rows]),
+        np.asarray([row[4] for row in rows]),
+    )
+
+
+def _component_pieces(vertices, faces):
+    """Split a triangle soup into edge-connected components."""
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64).reshape((-1, 3))
+    if len(faces) == 0:
+        return []
+    topology = _topology(len(vertices), faces)
+    parent = np.arange(len(faces))
 
     def find(index):
         root = index
         while parent[root] != root:
-            root = int(parent[root])
-        while parent[index] != index:
-            next_index = int(parent[index])
-            parent[index] = root
-            index = next_index
+            root = parent[root]
+        while parent[index] != root:
+            parent[index], index = root, parent[index]
         return root
 
-    def union(left, right):
-        left_root = find(int(left))
-        right_root = find(int(right))
-        if left_root != right_root:
-            parent[right_root] = left_root
-
-    for triangle in faces:
-        union(triangle[0], triangle[1])
-        union(triangle[1], triangle[2])
-
-    groups = {}
-    for face_index, triangle in enumerate(faces):
-        groups.setdefault(find(int(triangle[0])), []).append(face_index)
-    return [
-        np.asarray(indices, dtype=np.int32)
-        for indices in groups.values()
-    ]
-
-
-def _component_pieces(vertices, faces):
+    # Faces sharing any edge belong together, including open or non-manifold
+    # edges, so a damaged component is reported as one unit.
+    low = np.minimum(topology.start, topology.end)
+    high = np.maximum(topology.start, topology.end)
+    key = low * len(vertices) + high
+    order = np.argsort(key, kind="stable")
+    sorted_key = key[order]
+    for position in range(1, len(order)):
+        if sorted_key[position] == sorted_key[position - 1]:
+            left = find(int(topology.face[order[position - 1]]))
+            right = find(int(topology.face[order[position]]))
+            if left != right:
+                parent[right] = left
+    roots = np.asarray([find(index) for index in range(len(faces))])
     pieces = []
-    for face_indices in _component_face_groups(len(vertices), faces):
-        component_faces = faces[face_indices]
-        used = np.unique(component_faces.reshape(-1))
-        remap = np.full(len(vertices), -1, dtype=np.int32)
-        remap[used] = np.arange(len(used), dtype=np.int32)
-        piece = Piece(
-            vertices=vertices[used].copy(),
-            faces=remap[component_faces],
+    for root in np.unique(roots):
+        component_vertices, component_faces = _compact(
+            vertices,
+            faces[roots == root],
         )
-        pieces.append(_analyse_piece(piece))
+        pieces.append(
+            _analyse_piece(
+                Piece(vertices=component_vertices, faces=component_faces)
+            )
+        )
     return pieces
 
 
-def _canonical_plane(point, normal):
-    normal = np.asarray(normal, dtype=np.float64)
-    length = float(np.linalg.norm(normal))
-    if length <= 1.0e-10:
-        return None
-    normal /= length
-    offset = float(np.dot(point, normal))
-    for value in normal:
-        if abs(float(value)) <= 1.0e-10:
-            continue
-        if value < 0.0:
-            normal = -normal
-            offset = -offset
-        break
-    key = (
-        *(int(round(float(value) / PLANE_KEY_EPSILON)) for value in normal),
-        int(round(offset / PLANE_KEY_EPSILON)),
+# --------------------------------------------------------------------------
+# Exact plane cut
+# --------------------------------------------------------------------------
+
+def _plane_basis(normal):
+    helper = (
+        np.asarray((1.0, 0.0, 0.0))
+        if abs(normal[0]) < 0.9
+        else np.asarray((0.0, 1.0, 0.0))
     )
-    return key, normal, offset
+    u = np.cross(normal, helper)
+    u /= np.linalg.norm(u)
+    w = np.cross(normal, u)
+    return u, w
+
+
+def _trace_cap_loops(edges, points_2d):
+    """Chain directed cap edges into closed loops keeping the region on the left."""
+    outgoing = {}
+    for start, end in edges:
+        outgoing.setdefault(start, []).append(end)
+    remaining = {(start, end) for start, end in edges}
+    loops = []
+    while remaining:
+        start, end = min(remaining)
+        remaining.remove((start, end))
+        loop = [start]
+        previous, current = start, end
+        guard = 0
+        while current != start:
+            loop.append(current)
+            candidates = [
+                nxt for nxt in outgoing.get(current, ())
+                if (current, nxt) in remaining
+            ]
+            if not candidates:
+                return None
+            if len(candidates) > 1:
+                # At a pinch vertex take the sharpest left turn so that two
+                # regions touching in one point become two simple loops.
+                incoming = points_2d[current] - points_2d[previous]
+                base = math.atan2(incoming[1], incoming[0])
+
+                def turn(nxt):
+                    direction = points_2d[nxt] - points_2d[current]
+                    angle = math.atan2(direction[1], direction[0]) - base
+                    return (angle + math.pi) % (2.0 * math.pi)
+
+                nxt = max(candidates, key=turn)
+            else:
+                nxt = candidates[0]
+            remaining.remove((current, nxt))
+            previous, current = current, nxt
+            guard += 1
+            if guard > len(edges) + 1:
+                return None
+        if len(loop) >= 3:
+            loops.append(loop)
+    return loops
+
+
+def _ring_area(ring):
+    x = ring[:, 0]; y = ring[:, 1]
+    return 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+def _point_in_ring(point, ring):
+    x, y = point
+    inside = False
+    xs = ring[:, 0]; ys = ring[:, 1]
+    xn = np.roll(xs, -1); yn = np.roll(ys, -1)
+    crossing = (ys > y) != (yn > y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        xi = xs + (y - ys) * (xn - xs) / (yn - ys)
+    return bool(np.count_nonzero(crossing & (x < xi)) % 2)
+
+def _triangulate_loops(loops, coords):
+    """Triangulate planar loops with holes in float64 by ear clipping.
+
+    The region lies left of every loop: outer loops run counter-clockwise and
+    holes clockwise. Holes are bridged into their outer loop first. Output
+    triangles reference the original vertex ids and never add vertices.
+    """
+    rings = [np.asarray([coords[i] for i in loop], dtype=np.float64) for loop in loops]
+    areas = [_ring_area(r) for r in rings]
+    outers = [k for k, a in enumerate(areas) if a > 0.0]
+    holes = [k for k, a in enumerate(areas) if a <= 0.0]
+    assignment = {k: [] for k in outers}
+    for h in holes:
+        probe = rings[h][int(np.argmax(rings[h][:, 0]))]
+        containing = [k for k in outers if _point_in_ring(probe, rings[k])]
+        if not containing:
+            return None
+        best = min(containing, key=lambda k: areas[k])
+        assignment[best].append(h)
+    triangles = []
+    for k in outers:
+        polygon = list(loops[k])
+        for h in sorted(assignment[k], key=lambda h: -float(rings[h][:, 0].max())):
+            polygon = _bridge_hole(polygon, list(loops[h]), coords)
+            if polygon is None:
+                return None
+        result = _ear_clip(polygon, coords)
+        if result is None:
+            return None
+        triangles.extend(result)
+    return triangles
+
+def _bridge_hole(polygon, hole, coords):
+    hx = np.asarray([coords[i] for i in hole])
+    m = int(np.argmax(hx[:, 0]))
+    mx, my = hx[m]
+    pts = np.asarray([coords[i] for i in polygon])
+    nxt = np.roll(pts, -1, axis=0)
+    best = None
+    for e in range(len(polygon)):
+        (x0, y0), (x1, y1) = pts[e], nxt[e]
+        if (y0 > my) == (y1 > my) and not (y0 == my or y1 == my):
+            continue
+        if y0 == y1:
+            continue
+        t = (my - y0) / (y1 - y0)
+        if t < 0.0 or t > 1.0:
+            continue
+        xi = x0 + t * (x1 - x0)
+        if xi < mx:
+            continue
+        if best is None or xi < best[0]:
+            best = (xi, e)
+    if best is None:
+        return None
+    xi, e = best
+    # endpoint of the hit edge with larger x is the candidate
+    cand = e if pts[e][0] >= nxt[e][0] else (e + 1) % len(polygon)
+    px, py = pts[cand]
+    # reflex vertices inside triangle (M, I, P) take precedence: smallest angle to ray
+    tri = np.asarray([(mx, my), (xi, my), (px, py)])
+    chosen = cand
+    best_angle = None
+    for v in range(len(polygon)):
+        if v == cand:
+            continue
+        qx, qy = pts[v]
+        if qx < mx:
+            continue
+        if _inside_triangle((qx, qy), tri, strict=False):
+            angle = abs(math.atan2(qy - my, qx - mx))
+            dist = math.hypot(qx - mx, qy - my)
+            key = (angle, dist)
+            if best_angle is None or key < best_angle:
+                best_angle = key
+                chosen = v
+    rotated_hole = hole[m:] + hole[:m]
+    return polygon[:chosen + 1] + rotated_hole + [rotated_hole[0], polygon[chosen]] + polygon[chosen + 1:]
+
+def _inside_triangle(q, tri, strict=True):
+    (ax, ay), (bx, by), (cx, cy) = tri
+    d1 = (bx - ax) * (q[1] - ay) - (by - ay) * (q[0] - ax)
+    d2 = (cx - bx) * (q[1] - by) - (cy - by) * (q[0] - bx)
+    d3 = (ax - cx) * (q[1] - cy) - (ay - cy) * (q[0] - cx)
+    if strict:
+        return (d1 > 0 and d2 > 0 and d3 > 0) or (d1 < 0 and d2 < 0 and d3 < 0)
+    return (d1 >= 0 and d2 >= 0 and d3 >= 0) or (d1 <= 0 and d2 <= 0 and d3 <= 0)
+
+def _ear_clip(polygon, coords):
+    ids = list(polygon)
+    pts = np.asarray([coords[i] for i in ids], dtype=np.float64)
+    n = len(ids)
+    prev = list(range(-1, n - 1)); prev[0] = n - 1
+    nxt = list(range(1, n + 1)); nxt[-1] = 0
+    alive = np.ones(n, dtype=bool)
+    scale = max(float(np.ptp(pts, axis=0).max()), 1e-9)
+    eps = scale * scale * 1e-14
+    triangles = []
+    remaining = n
+    current = 0
+    stall = 0
+    allow_flat = False
+    while remaining > 3:
+        p, c, q = prev[current], current, nxt[current]
+        a, b, d = pts[p], pts[c], pts[q]
+        cross = (b[0] - a[0]) * (d[1] - a[1]) - (b[1] - a[1]) * (d[0] - a[0])
+        is_ear = False
+        if cross > eps or (allow_flat and cross >= -eps):
+            others = np.flatnonzero(alive)
+            others = others[(others != p) & (others != c) & (others != q)]
+            if len(others):
+                o = pts[others]
+                # ignore vertices coincident with the triangle corners (bridge duplicates)
+                same = (
+                    np.all(np.abs(o - a) <= 1e-12, axis=1)
+                    | np.all(np.abs(o - b) <= 1e-12, axis=1)
+                    | np.all(np.abs(o - d) <= 1e-12, axis=1)
+                )
+                o = o[~same]
+                if cross > eps and len(o):
+                    d1 = (b[0] - a[0]) * (o[:, 1] - a[1]) - (b[1] - a[1]) * (o[:, 0] - a[0])
+                    d2 = (d[0] - b[0]) * (o[:, 1] - b[1]) - (d[1] - b[1]) * (o[:, 0] - b[0])
+                    d3 = (a[0] - d[0]) * (o[:, 1] - d[1]) - (a[1] - d[1]) * (o[:, 0] - d[0])
+                    inside = (d1 >= -eps) & (d2 >= -eps) & (d3 >= -eps)
+                    is_ear = not np.any(inside)
+                else:
+                    is_ear = True
+            else:
+                is_ear = True
+        if is_ear:
+            triangles.append((ids[p], ids[c], ids[q]))
+            alive[c] = False
+            nxt[p] = q
+            prev[q] = p
+            remaining -= 1
+            current = q
+            stall = 0
+            allow_flat = False
+        else:
+            current = q
+            stall += 1
+            if stall > remaining:
+                if allow_flat:
+                    return None
+                allow_flat = True
+                stall = 0
+    last = np.flatnonzero(alive)
+    c = int(last[0])
+    triangles.append((ids[prev[c]], ids[c], ids[nxt[c]]))
+    return triangles
+
+
+def _cut_piece(piece, plane_point, plane_normal):
+    """Split a closed piece by a plane.
+
+    Returns (negative_components, positive_components) or None when the plane
+    misses the piece or the cut cannot be closed exactly.
+    """
+    normal = np.asarray(plane_normal, dtype=np.float64)
+    length = float(np.linalg.norm(normal))
+    if length <= 1.0e-12:
+        return None
+    normal = normal / length
+    offset = float(np.dot(normal, plane_point))
+    vertices = piece.vertices
+    faces = piece.faces.astype(np.int64)
+    distance = vertices @ normal - offset
+    side = np.zeros(len(vertices), dtype=np.int8)
+    side[distance > PLANE_EPSILON] = 1
+    side[distance < -PLANE_EPSILON] = -1
+    if not (side > 0).any() or not (side < 0).any():
+        return None
+    # Snap the on-plane band exactly onto the plane. Both halves then share
+    # one flat cap, so the clearance between them is the requested gap and
+    # not the leftover tilt of the band.
+    on_plane = side == 0
+    if on_plane.any():
+        vertices = vertices.copy()
+        vertices[on_plane] -= np.outer(distance[on_plane], normal)
+        distance = distance.copy()
+        distance[on_plane] = 0.0
+
+    face_side = side[faces]
+    any_positive = (face_side > 0).any(axis=1)
+    any_negative = (face_side < 0).any(axis=1)
+    positive_mask = any_positive & ~any_negative
+    negative_mask = any_negative & ~any_positive
+    coplanar_mask = ~any_positive & ~any_negative
+    crossing = np.flatnonzero(any_positive & any_negative)
+
+    negative_faces = [faces[negative_mask]]
+    positive_faces = [faces[positive_mask]]
+    if coplanar_mask.any():
+        normals, _areas = _face_normals(vertices, faces[coplanar_mask])
+        facing = normals @ normal
+        coplanar = faces[coplanar_mask]
+        # A face on the plane bounds the half on the opposite side of its
+        # outward normal.
+        negative_faces.append(coplanar[facing >= 0.0])
+        positive_faces.append(coplanar[facing < 0.0])
+
+    new_points = []
+    edge_points = {}
+
+    def crossing_vertex(left, right):
+        key = (left, right) if left < right else (right, left)
+        index = edge_points.get(key)
+        if index is None:
+            t = distance[left] / (distance[left] - distance[right])
+            new_points.append(vertices[left] + (vertices[right] - vertices[left]) * t)
+            index = len(vertices) + len(new_points) - 1
+            edge_points[key] = index
+        return index
+
+    extra_negative = []
+    extra_positive = []
+    for face_index in crossing:
+        triangle = faces[face_index]
+        signs = side[triangle]
+        zero = np.flatnonzero(signs == 0)
+        if len(zero) == 1:
+            k = int(zero[0])
+            z, p, q = triangle[k], triangle[(k + 1) % 3], triangle[(k + 2) % 3]
+            x = crossing_vertex(int(p), int(q))
+            first = (z, p, x)
+            second = (z, x, q)
+            (extra_positive if side[p] > 0 else extra_negative).append(first)
+            (extra_positive if side[q] > 0 else extra_negative).append(second)
+        else:
+            total = int(signs.sum())
+            lone_sign = -1 if total > 0 else 1
+            k = int(np.flatnonzero(signs == lone_sign)[0])
+            lone, a, b = triangle[k], triangle[(k + 1) % 3], triangle[(k + 2) % 3]
+            x1 = crossing_vertex(int(lone), int(a))
+            x2 = crossing_vertex(int(b), int(lone))
+            lone_faces = [(lone, x1, x2)]
+            other_faces = [(x1, a, b), (x1, b, x2)]
+            if lone_sign > 0:
+                extra_positive.extend(lone_faces)
+                extra_negative.extend(other_faces)
+            else:
+                extra_negative.extend(lone_faces)
+                extra_positive.extend(other_faces)
+
+    if new_points:
+        all_vertices = np.vstack((vertices, np.asarray(new_points)))
+    else:
+        all_vertices = vertices
+    all_side = np.r_[side, np.zeros(len(new_points), dtype=np.int8)]
+    all_distance = np.r_[distance, np.zeros(len(new_points))]
+    if extra_negative:
+        negative_faces.append(np.asarray(extra_negative, dtype=np.int64))
+    if extra_positive:
+        positive_faces.append(np.asarray(extra_positive, dtype=np.int64))
+    negative = np.vstack(negative_faces) if negative_faces else np.empty((0, 3))
+    positive = np.vstack(positive_faces) if positive_faces else np.empty((0, 3))
+    if len(negative) == 0 or len(positive) == 0:
+        return None
+
+    # Sliver triangles can place two section points a few micrometres apart.
+    # Weld them so that the cap triangulation sees one point.
+    weld = _weld_plane_vertices(all_vertices, all_side, np.vstack((negative, positive)))
+    if weld is not None:
+        negative = weld[negative]
+        positive = weld[positive]
+        negative = negative[
+            (negative[:, 0] != negative[:, 1])
+            & (negative[:, 1] != negative[:, 2])
+            & (negative[:, 2] != negative[:, 0])
+        ]
+        positive = positive[
+            (positive[:, 0] != positive[:, 1])
+            & (positive[:, 1] != positive[:, 2])
+            & (positive[:, 2] != positive[:, 0])
+        ]
+        if len(negative) == 0 or len(positive) == 0:
+            return None
+
+    # The open border of the negative half lies on the plane. Its reversed
+    # edges form the cap boundary with the cap region on the left.
+    topology = _topology(len(all_vertices), negative)
+    low = np.minimum(topology.start, topology.end)
+    high = np.maximum(topology.start, topology.end)
+    key = low * len(all_vertices) + high
+    unique_keys, inverse, counts = np.unique(
+        key,
+        return_inverse=True,
+        return_counts=True,
+    )
+    if np.any(counts > 2):
+        return None
+    border = np.flatnonzero(counts[inverse] == 1)
+    if len(border) < 3:
+        return None
+    border_start = topology.start[border]
+    border_end = topology.end[border]
+    if np.any(all_side[border_start] != 0) or np.any(all_side[border_end] != 0):
+        return None
+
+    u, w = _plane_basis(normal)
+    cap_vertices = np.unique(np.r_[border_start, border_end])
+    # Local coordinates keep float32 mathutils vectors precise.
+    cap_origin = all_vertices[cap_vertices].mean(axis=0)
+    points_2d = {
+        int(index): np.asarray(
+            (
+                float(np.dot(all_vertices[index] - cap_origin, u)),
+                float(np.dot(all_vertices[index] - cap_origin, w)),
+            )
+        )
+        for index in cap_vertices
+    }
+    cap_edges = [
+        (int(end), int(start))
+        for start, end in zip(border_start, border_end)
+    ]
+    loops = _trace_cap_loops(cap_edges, points_2d)
+    if not loops:
+        return None
+    triangles = _triangulate_loops(loops, points_2d)
+    if not triangles:
+        return None
+    cap = np.asarray(triangles, dtype=np.int64)
+    signed = 0.0
+    for a, b, c in cap:
+        pa, pb, pc = points_2d[int(a)], points_2d[int(b)], points_2d[int(c)]
+        signed += (
+            (pb[0] - pa[0]) * (pc[1] - pa[1])
+            - (pc[0] - pa[0]) * (pb[1] - pa[1])
+        )
+    # The negative cap faces along +normal: counter-clockwise in (u, w).
+    if signed < 0.0:
+        cap = cap[:, ::-1]
+
+    loop_area = 0.0
+    for loop in loops:
+        ring = np.asarray([points_2d[index] for index in loop])
+        x, y = ring[:, 0], ring[:, 1]
+        loop_area += 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    cap_area_2d = 0.0
+    for a, b, c in cap:
+        pa, pb, pc = points_2d[int(a)], points_2d[int(b)], points_2d[int(c)]
+        cap_area_2d += 0.5 * ((pb[0] - pa[0]) * (pc[1] - pa[1]) - (pc[0] - pa[0]) * (pb[1] - pa[1]))
+    # Both halves share the cap, so volume conservation cannot reveal a cap
+    # that covers empty space. The exact section area can.
+    if (
+        loop_area <= 0.0
+        or abs(cap_area_2d - loop_area) > 1.0e-6 * max(loop_area, 1.0) + 1.0e-7
+    ):
+        return None
+    # Every cap point must lie inside the parent solid. A cap that covers
+    # empty space conserves volume (both halves share it) and would pass the
+    # checks below, but its winding number with respect to the parent is 0.
+    cap_corners = all_vertices[cap]
+    cap_areas = 0.5 * np.linalg.norm(
+        np.cross(cap_corners[:, 1] - cap_corners[:, 0], cap_corners[:, 2] - cap_corners[:, 0]),
+        axis=1,
+    )
+    probe = np.argsort(-cap_areas)[:64]
+    probe = probe[cap_areas[probe] > 1.0e-8]
+    if len(probe):
+        winding = _winding_numbers(
+            piece.vertices - cap_origin,
+            piece.faces.astype(np.int64),
+            cap_corners[probe].mean(axis=1) - cap_origin,
+        )
+        if np.any(winding < 0.5):
+            return None
+    # A face lying on the plane must face away from its half. A face facing
+    # into its own half means a tilted source face straddled the on-plane band
+    # and would leave a sheet over empty space.
+    for half_faces, direction in ((negative, 1.0), (positive, -1.0)):
+        near = np.all(np.abs(all_distance[half_faces]) <= PLANE_EPSILON * 5.0, axis=1)
+        if near.any():
+            half_normals, half_areas = _face_normals(all_vertices, half_faces[near])
+            if np.any((half_normals @ normal) * direction < -0.5):
+                return None
+    negative_closed = np.vstack((negative, cap))
+    positive_closed = np.vstack((positive, cap[:, ::-1]))
+    halves = []
+    total_volume = 0.0
+    for half_faces in (negative_closed, positive_closed):
+        half_topology = _topology(len(all_vertices), half_faces)
+        if not half_topology.closed:
+            return None
+        components = _split_components(all_vertices, half_faces, half_topology)
+        halves.append(components)
+        total_volume += sum(component.volume for component in components)
+    # Welding moves section points by at most PLANE_EPSILON inside the plane,
+    # so the conserved volume may only drift by that band over the section.
+    cap_area = float(_face_normals(all_vertices, cap)[1].sum())
+    allowance = (
+        VOLUME_ABSOLUTE_EPSILON
+        + abs(piece.volume) * VOLUME_RELATIVE_EPSILON
+        + 2.0 * PLANE_EPSILON * cap_area
+    )
+    if abs(total_volume - piece.volume) > allowance:
+        return None
+    for components in halves:
+        for component in components:
+            component.depth = piece.depth + 1
+    return halves[0], halves[1]
+
+
+def _weld_plane_vertices(vertices, side, faces, distance=PLANE_EPSILON):
+    """Return an index map merging on-plane vertices closer than distance."""
+    used = np.unique(faces.reshape(-1))
+    candidates = used[side[used] == 0]
+    if len(candidates) < 2:
+        return None
+    points = vertices[candidates]
+    cells = np.floor(points / distance).astype(np.int64)
+    grid = {}
+    for position, cell in enumerate(map(tuple, cells)):
+        grid.setdefault(cell, []).append(position)
+    remap = np.arange(len(vertices))
+    merged = False
+    neighbours = [
+        (dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+    ]
+    for position, cell in enumerate(map(tuple, cells)):
+        index = candidates[position]
+        if remap[index] != index:
+            continue
+        for dx, dy, dz in neighbours:
+            for other in grid.get((cell[0] + dx, cell[1] + dy, cell[2] + dz), ()):
+                target = candidates[other]
+                if other <= position or remap[target] != target:
+                    continue
+                delta = points[other] - points[position]
+                if float(delta @ delta) <= distance * distance:
+                    remap[target] = index
+                    merged = True
+    return remap if merged else None
+
+
+def _split_components(vertices, faces, topology):
+    parent = np.arange(len(faces))
+
+    def find(index):
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != root:
+            parent[index], index = root, parent[index]
+        return root
+
+    for left, right in zip(topology.face[topology.first], topology.face[topology.second]):
+        a, b = find(int(left)), find(int(right))
+        if a != b:
+            parent[b] = a
+    roots = np.asarray([find(index) for index in range(len(faces))])
+    components = []
+    for root in np.unique(roots):
+        component_vertices, component_faces = _compact(vertices, faces[roots == root])
+        volume = _signed_volume(component_vertices, component_faces)
+        if volume <= VOLUME_ABSOLUTE_EPSILON:
+            # A zero-volume flap between touching regions carries no solid.
+            continue
+        components.append(
+            _analyse_piece(Piece(vertices=component_vertices, faces=component_faces))
+        )
+    return components
+
+
+# --------------------------------------------------------------------------
+# Choice of the cutting plane
+# --------------------------------------------------------------------------
+
+def _section_area(vertices, faces, normal, offset):
+    """Area of the solid cross-section by a plane, without cutting.
+
+    Every triangle is clipped to the negative half-space in winding order.
+    Clipped edges lying on the plane bound the negative half there; interior
+    ones cancel, and Green theorem turns the remaining border into area.
+    """
+    distance = vertices @ normal - offset
+    side = np.zeros(len(vertices), dtype=np.int8)
+    side[distance > PLANE_EPSILON] = 1
+    side[distance < -PLANE_EPSILON] = -1
+    face_side = side[faces]
+    touching = (face_side == 0).any(axis=1) | (
+        (face_side > 0).any(axis=1) & (face_side < 0).any(axis=1)
+    )
+    coplanar = ~face_side.any(axis=1)
+    if coplanar.any():
+        corners = vertices[faces[coplanar]]
+        facing = np.cross(
+            corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]
+        ) @ normal
+        # A face on the plane bounds the negative half only when facing +normal.
+        touching[np.flatnonzero(coplanar)[facing < 0.0]] = False
+    selected = faces[touching]
+    if len(selected) == 0:
+        return 0.0
+    corner_points = vertices[selected]
+    corner_side = side[selected]
+    corner_distance = distance[selected]
+    count = len(selected)
+    points = np.zeros((count, 6, 3))
+    valid = np.zeros((count, 6), dtype=bool)
+    on = np.zeros((count, 6), dtype=bool)
+    for corner in range(3):
+        following = (corner + 1) % 3
+        points[:, corner * 2] = corner_points[:, corner]
+        valid[:, corner * 2] = corner_side[:, corner] <= 0
+        on[:, corner * 2] = corner_side[:, corner] == 0
+        crossing = corner_side[:, corner] * corner_side[:, following] < 0
+        denominator = corner_distance[:, corner] - corner_distance[:, following]
+        t = np.divide(
+            corner_distance[:, corner],
+            denominator,
+            out=np.zeros(count),
+            where=crossing,
+        )
+        points[:, corner * 2 + 1] = corner_points[:, corner] + (
+            corner_points[:, following] - corner_points[:, corner]
+        ) * t[:, None]
+        valid[:, corner * 2 + 1] = crossing
+        on[:, corner * 2 + 1] = crossing
+    total = 0.0
+    slots = np.arange(6)
+    rows = np.arange(count)
+    for slot in range(6):
+        # Next valid slot of every clipped polygon, cyclically.
+        order = (slot + 1 + slots) % 6
+        following_valid = valid[:, order]
+        nxt = order[np.argmax(following_valid, axis=1)]
+        use = valid[:, slot] & on[:, slot] & following_valid.any(axis=1)
+        use &= on[rows, nxt]
+        if not use.any():
+            continue
+        start = points[use, slot]
+        end = points[rows[use], nxt[use]]
+        total += float((np.cross(start, end) @ normal).sum())
+    return abs(total) * 0.5
+
+
+def _rank_planes(piece, normals, offsets, areas, tolerances, centroids, thin_limit):
+    """Order cutting planes by concavity removed per unit of section area.
+
+    Each violated facet plane has a set of vertices in front of it. A cut
+    removes those that end up in the other child than the facet. Cutting a
+    pilaster off along its wall, or the tower off the grooves of its plinth,
+    removes many such violations through a modest section; a plane through
+    the side of a single groove slices the building for little gain.
+    """
+    if len(normals) == 0:
+        return []
+    vertices = piece.vertices
+    faces = piece.faces.astype(np.int64)
+    distance = vertices @ normals.T - offsets
+    side = np.zeros(distance.shape, dtype=np.int8)
+    side[distance > PLANE_EPSILON] = 1
+    side[distance < -PLANE_EPSILON] = -1
+    cuts = (
+        (distance.max(axis=0) > GRAZING_EPSILON)
+        & (-distance.min(axis=0) > GRAZING_EPSILON)
+    )
+    unique = {}
+    for index in np.flatnonzero(cuts):
+        unique.setdefault(tuple(side[:, index].tolist()), int(index))
+    candidates = list(unique.values())
+    if not candidates:
+        return []
+
+    # A plane running closer than the thin limit to a parallel facet of the
+    # same piece slices a slab out of solid material instead of cutting a
+    # feature off; such planes go last.
+    slab = np.zeros(len(candidates), dtype=bool)
+    facets = getattr(piece, "facet_planes", None)
+    if facets is not None and len(facets[0]):
+        facet_normals, facet_offsets = facets[0], facets[1]
+        alignment = normals[candidates] @ facet_normals.T
+        separation = np.abs(
+            np.sign(alignment) * facet_offsets[None, :] - offsets[candidates][:, None]
+        )
+        slab = np.any(
+            (np.abs(alignment) > 0.999)
+            & (separation > GRAZING_EPSILON)
+            & (separation < thin_limit),
+            axis=1,
+        )
+
+
+    front = (distance > tolerances[None, :]).astype(np.float32)
+    positive = (side[:, candidates] > 0).astype(np.float32)
+    negative = (side[:, candidates] < 0).astype(np.float32)
+    in_negative = front.T @ negative
+    in_positive = front.T @ positive
+    facet_distance = centroids @ normals[candidates].T - offsets[candidates]
+    facet_side = np.sign(facet_distance)
+    on_cut = np.abs(facet_distance) <= PLANE_EPSILON * 5.0
+    alignment = normals @ normals[candidates].T
+    facet_side[on_cut] = np.where(alignment[on_cut] > 0.0, -1.0, 1.0)
+    removed = np.where(facet_side > 0, in_negative, in_positive).sum(axis=0)
+
+    sections = np.asarray([
+        _section_area(vertices, faces, normals[index], offsets[index])
+        for index in candidates
+    ])
+    score = removed / (sections + 1.0e-2)
+    order = sorted(
+        (
+            position
+            for position in range(len(candidates))
+            if sections[position] > 1.0e-6 and removed[position] > 0.0
+        ),
+        key=lambda position: (
+            bool(slab[position]),
+            -round(float(score[position]), 9),
+            round(float(sections[position]), 6),
+            tuple(np.round(normals[candidates[position]], 6)),
+        ),
+    )
+    return [
+        (normals[candidates[position]], offsets[candidates[position]])
+        for position in order
+    ]
+
+
+def _fallback_planes(piece, limit=8):
+    """Face, bisector and axis planes through the most folded edges."""
+    vertices = piece.vertices
+    faces = piece.faces.astype(np.int64)
+    topology = _topology(len(vertices), faces)
+    normals, _areas = _face_normals(vertices, faces)
+    depths = _edge_fold_depths(vertices, topology, normals)
+    found = {}
+    for edge in np.argsort(-depths)[:limit]:
+        if depths[edge] <= 0.0:
+            break
+        first = topology.first[edge]
+        second = topology.second[edge]
+        a = vertices[topology.start[first]]
+        b = vertices[topology.end[first]]
+        direction = b - a
+        length = float(np.linalg.norm(direction))
+        if length <= 1.0e-9:
+            continue
+        direction /= length
+        n1 = normals[topology.face[first]]
+        n2 = normals[topology.face[second]]
+        for raw in (n1, n2, n1 + n2, n1 - n2, *np.eye(3)):
+            unit = raw - direction * float(raw @ direction)
+            unit_length = float(np.linalg.norm(unit))
+            if unit_length <= 1.0e-6:
+                continue
+            unit = unit / unit_length
+            offset = float(unit @ ((a + b) * 0.5))
+            key = (
+                *np.round(unit * 1.0e4).astype(np.int64).tolist(),
+                int(round(offset * 1.0e4)),
+            )
+            found.setdefault(key, (unit, offset, (a + b) * 0.5))
+    if not found:
+        return (
+            np.empty((0, 3)), np.empty(0), np.empty(0), np.empty(0),
+            np.empty((0, 3)),
+        )
+    rows = list(found.values())
+    return (
+        np.asarray([row[0] for row in rows]),
+        np.asarray([row[1] for row in rows]),
+        np.zeros(len(rows)),
+        np.full(len(rows), _feature_tolerance),
+        np.asarray([row[2] for row in rows]),
+    )
+
+
+def _split_piece_keyed(piece, thin_limit, skip=0):
+    """Cut a piece and name the cut that was taken.
+
+    With skip > 0 the best ranked planes are passed over, which yields a
+    different, equally exact variant of the subtree. The name is the stage
+    the plane came from and its position in that stage's ranking, so the
+    search can tell two variants that took the same cut apart from two that
+    did not.
+
+    Rankings and cuts are kept on the piece. The variant search asks for the
+    same piece again with the window moved by one plane; the window shares
+    all but one plane with the previous one, and without the cache every one
+    of them was ranked and cut again.
+    """
+    violated = getattr(piece, "violated_planes", None)
+    if violated is None:
+        return None, None
+    stages = (
+        lambda: violated,
+        lambda: getattr(piece, "facet_planes", None),
+        lambda: _fallback_planes(piece),
+    )
+    rankings = piece.__dict__.setdefault("_rankings", {})
+    cuts = piece.__dict__.setdefault("_cuts", {})
+    for stage_index, stage in enumerate(stages):
+        ranking_key = (stage_index, thin_limit)
+        if ranking_key in rankings:
+            ranked = rankings[ranking_key]
+        else:
+            planes = stage()
+            ranked = None if planes is None else _rank_planes(
+                piece, *planes, thin_limit
+            )
+            rankings[ranking_key] = ranked
+        if ranked is None:
+            continue
+        options = []
+        for position in range(skip, min(skip + MAX_CUT_ATTEMPTS, len(ranked))):
+            cut_key = (stage_index, position)
+            if cut_key in cuts:
+                children = cuts[cut_key]
+            else:
+                normal, offset = ranked[position]
+                result = _cut_piece(piece, normal * offset, normal)
+                children = None if result is None else result[0] + result[1]
+                cuts[cut_key] = children
+            if children is None:
+                continue
+            if len(children) >= 2 or (
+                len(children) == 1
+                and children[0].concave_edges < piece.concave_edges
+            ):
+                remaining = sum(child.concave_edges for child in children)
+                slivers = sum(
+                    1 for child in children
+                    if _cached_extent(child) < thin_limit
+                )
+                options.append((slivers, remaining, len(options), children, cut_key))
+                if slivers == 0 and remaining == 0:
+                    # Children convex and none of them thin. The ranking key
+                    # is (slivers, remaining, order), so nothing tried later
+                    # can beat this and the selection below would pick it
+                    # anyway; stopping here only skips work.
+                    break
+                if len(options) >= CUT_LOOKAHEAD:
+                    break
+        if options:
+            best = min(options, key=lambda item: item[:3])
+            return best[4], best[3]
+    return None, None
+
+
+def _cached_extent(piece):
+    extent = piece.__dict__.get("_last_extent")
+    if extent is None:
+        extent = float(_piece_extents(piece)[-1])
+        piece._last_extent = extent
+    return extent
+
+
+# --------------------------------------------------------------------------
+# Convex post-processing
+# --------------------------------------------------------------------------
+
+def _hull_piece(vertices, faces=None, depth=0):
+    hull = _convex_hull(vertices)
+    if hull is None:
+        return None
+    return _analyse_piece(Piece(vertices=hull[0], faces=hull[1], depth=depth))
+
+
+def _convex_planes(piece):
+    """Return outward support planes bounding the convex hull of a piece.
+
+    Every plane is placed at the furthest vertex along its normal, so it
+    supports the piece by construction. Dropping planes that a sliver normal
+    makes look non-supporting would open the half-space set and report
+    neighbours as intersecting when they only touch.
+    """
+    vertices = np.asarray(piece.vertices, dtype=np.float64)
+    faces = np.asarray(piece.faces, dtype=np.int64)
+    if len(faces) == 0 or len(vertices) == 0:
+        return []
+    normals, areas = _face_normals(vertices, faces)
+    order = np.argsort(-areas)
+    order = order[areas[order] > 1.0e-12]
+    if len(order) == 0:
+        return []
+    kept = normals[order]
+    # One projection of every vertex against every candidate normal replaces
+    # a projection per face; this runs for each overlap test, tens of
+    # thousands of times per decomposition.
+    projection = vertices @ kept.T
+    support = projection.argmax(axis=0)
+    keys = np.column_stack((
+        np.round(kept * 1.0e4).astype(np.int64),
+        np.round(projection[support, np.arange(len(order))] * 1.0e4).astype(np.int64),
+    ))
+    # First occurrence wins, in descending area order, as the dict did.
+    _unique, first = np.unique(keys, axis=0, return_index=True)
+    first = np.sort(first)
+    return [
+        (vertices[support[index]], kept[index]) for index in first.tolist()
+    ]
+
+
+def _plane_arrays(planes):
+    """Pack (point, normal) planes into normal and offset arrays."""
+    if not planes:
+        return np.empty((0, 3)), np.empty(0)
+    normals = np.asarray([normal for _point, normal in planes])
+    offsets = np.asarray([float(normal @ point) for point, normal in planes])
+    return normals, offsets
+
+
+def _points_inside_convex(points, planes, epsilon=1.0e-7):
+    """Boolean mask of points behind every plane."""
+    normals, offsets = _plane_arrays(planes)
+    if len(normals) == 0:
+        return np.zeros(len(points), dtype=bool)
+    return np.all(np.asarray(points) @ normals.T - offsets <= epsilon, axis=1)
+
+
+def _point_inside_convex(point, planes, epsilon=1.0e-7):
+    return bool(_points_inside_convex(np.asarray(point)[None, :], planes, epsilon)[0])
+
+
+def _convex_test_samples(piece):
+    vertices = piece.vertices
+    faces = np.asarray(piece.faces, dtype=np.int64)
+    centroids = vertices[faces].mean(axis=1)
+    # The samples are only ever asked whether any of them is inside another
+    # hull, so their order carries no meaning and the edge set can be built
+    # with numpy instead of a Python set over every triangle.
+    pairs = np.sort(
+        np.concatenate((faces[:, :2], faces[:, 1:], faces[:, ::2]), axis=0),
+        axis=1,
+    )
+    pairs = np.unique(pairs, axis=0)
+    left = vertices[pairs[:, 0]]
+    right = vertices[pairs[:, 1]]
+    edge_samples = np.concatenate(
+        [left * (1.0 - fraction) + right * fraction
+         for fraction in (0.25, 0.5, 0.75)],
+        axis=0,
+    )
+    return np.vstack((vertices, edge_samples, centroids))
+
+
+def _pieces_overlap(subject, cutter, clearance=1.0e-6):
+    """Return true only for positive-volume overlap, not shared boundaries."""
+    if len(subject.vertices) == 0 or len(cutter.vertices) == 0:
+        return False
+    s_min = subject.vertices.min(axis=0)
+    s_max = subject.vertices.max(axis=0)
+    c_min = cutter.vertices.min(axis=0)
+    c_max = cutter.vertices.max(axis=0)
+    if np.any(s_max < c_min + clearance) or np.any(c_max < s_min + clearance):
+        return False
+    return bool(
+        _points_inside_convex(
+            _convex_test_samples(subject), _convex_planes(cutter), -clearance
+        ).any()
+        or _points_inside_convex(
+            _convex_test_samples(cutter), _convex_planes(subject), -clearance
+        ).any()
+    )
+
+
+def _subtract_convex_fragments(subject, cutter):
+    """Keep every convex fragment of subject outside cutter."""
+    if not _pieces_overlap(subject, cutter):
+        return [subject]
+    inside = [subject]
+    outside = []
+    for plane_point, plane_normal in _convex_planes(cutter):
+        next_inside = []
+        for fragment in inside:
+            result = _cut_piece(fragment, plane_point, plane_normal)
+            if result is None:
+                distances = fragment.vertices @ plane_normal - float(
+                    plane_normal @ plane_point
+                )
+                if float(distances.min()) >= -PLANE_EPSILON:
+                    outside.append(fragment)
+                else:
+                    next_inside.append(fragment)
+                continue
+            negative, positive = result
+            outside.extend(positive)
+            next_inside.extend(negative)
+        inside = next_inside
+        if not inside:
+            break
+    return outside
+
+
+def _bridge_is_shallow(hull, parts, source_bvh, origin, limit):
+    """True when a hull only adds shallow empty space over the given parts.
+
+    Every hull sample outside all parts must sit within the limit above one
+    of them and in empty space, so the hull can never fill an opening or
+    cover the material of another part.
+    """
+    samples, sample_normals = _surface_samples(*hull)
+    inside = np.zeros(len(samples), dtype=bool)
+    bvhs = []
+    for part in parts:
+        normals, offsets = _plane_arrays(_convex_planes(part))
+        if len(normals):
+            inside |= np.all(samples @ normals.T - offsets <= REFLEX_EPSILON, axis=1)
+        bvhs.append(_surface_bvh(part.vertices - origin, part.faces))
+    for point, normal in zip(samples[~inside] - origin, sample_normals[~inside]):
+        local = Vector(tuple(point))
+        direction = Vector(tuple(-normal))
+        depth = min(
+            (
+                float(hit[3])
+                for hit in (bvh.ray_cast(local, direction, limit) for bvh in bvhs)
+                if hit[0] is not None
+            ),
+            default=math.inf,
+        )
+        if depth == math.inf:
+            # The ray grazes along a seam; fall back to the nearest surface.
+            depth = min(
+                (
+                    float(hit[3])
+                    for hit in (bvh.find_nearest(local) for bvh in bvhs)
+                    if hit[0] is not None
+                ),
+                default=math.inf,
+            )
+        if depth > limit:
+            return False
+        if depth > PLANE_EPSILON and _inside_source(source_bvh, point):
+            return False
+    return True
+
+
+def _absorb_thin_pieces(pieces, thin_limit, tolerance, source_bvh, origin):
+    """Fold parts thinner than the threshold into a neighbouring part.
+
+    A sliver left between two parts cannot merge on its own: its hull would
+    reach over the part on the far side. Clipping that hull along the plane
+    that already separates the two keeps the union convex, swallows the
+    sliver and touches nothing else.
+    """
+    pieces = [piece for piece in pieces]
+    for _round in range(3):
+        widths = [_minimum_width(piece) for piece in pieces]
+        order = sorted(
+            (index for index, width in enumerate(widths) if width < thin_limit),
+            key=lambda index: pieces[index].volume,
+        )
+        if not order:
+            break
+        absorbed = []
+        for index in order:
+            thin = pieces[index]
+            if thin is None:
+                continue
+            low = thin.vertices.min(axis=0) - thin_limit
+            high = thin.vertices.max(axis=0) + thin_limit
+            neighbours = [
+                other for other, piece in enumerate(pieces)
+                if piece is not None and other != index
+                and np.all(piece.vertices.min(axis=0) <= high)
+                and np.all(piece.vertices.max(axis=0) >= low)
+            ]
+            neighbours.sort(key=lambda other: -pieces[other].volume)
+            for other in neighbours:
+                host = pieces[other]
+                hull = _convex_hull(
+                    np.vstack((thin.vertices, host.vertices)), simplify=False
+                )
+                if hull is None or not _bridge_is_shallow(
+                    hull, (thin, host), source_bvh, origin, thin_limit
+                ):
+                    continue
+                merged = _hull_piece(np.vstack((thin.vertices, host.vertices)))
+                if merged is None or not merged.closed:
+                    continue
+                merged = _clip_against_others(
+                    merged, pieces, {index, other}, (thin, host), tolerance
+                )
+                if merged is None:
+                    continue
+                pieces[other] = merged
+                pieces[index] = None
+                absorbed.append(index)
+                break
+        if not absorbed:
+            break
+        pieces = [piece for piece in pieces if piece is not None]
+    return [piece for piece in pieces if piece is not None]
+
+
+def _clip_against_others(merged, pieces, skip, keep, tolerance):
+    """Clip a merged hull off every other piece it would cover.
+
+    Returns the clipped hull, or None when clipping would eat into the two
+    pieces it is supposed to contain.
+    """
+    for index, other in enumerate(pieces):
+        if other is None or index in skip:
+            continue
+        if not _pieces_overlap(merged, other, clearance=1.0e-6):
+            continue
+        separated = False
+        for point, normal in _convex_planes(other):
+            offset = float(normal @ point)
+            if all(
+                float((piece.vertices @ normal).max()) <= offset + PLANE_EPSILON
+                for piece in keep
+            ):
+                result = _cut_piece(merged, normal * offset, normal)
+                if result is None:
+                    continue
+                negative, _positive = result
+                if not negative:
+                    continue
+                clipped = _hull_piece(
+                    np.vstack([piece.vertices for piece in negative])
+                )
+                if clipped is None or not clipped.closed:
+                    continue
+                merged = clipped
+                separated = True
+                break
+        if not separated:
+            return None
+    # the clipped hull must still hold both pieces
+    planes = _convex_planes(merged)
+    normals, offsets = _plane_arrays(planes)
+    if len(normals) == 0:
+        return None
+    for piece in keep:
+        if float((piece.vertices @ normals.T - offsets).max()) > tolerance:
+            return None
+    # and it must not overlap anything else after the clipping
+    for index, other in enumerate(pieces):
+        if other is None or index in skip:
+            continue
+        if _pieces_overlap(merged, other, clearance=1.0e-6):
+            return None
+    return merged
+
+
+def _separate_touching_pieces(pieces, limit=REFLEX_EPSILON, max_rounds=4):
+    """Remove sub-millimetre interpenetration between convex neighbours.
+
+    Tolerant hulls, the on-plane band and float32 rounding can leave two
+    neighbours sharing a sliver thinner than a cut can resolve. The smaller
+    piece of such a pair is inset by the measured penetration, which keeps
+    the deviation far below the gap while clearing the intersection.
+    """
+    pieces = list(pieces)
+    for _round in range(max_rounds):
+        bounds = [
+            (piece.vertices.min(axis=0), piece.vertices.max(axis=0))
+            for piece in pieces
+        ]
+        changed = False
+        for left in range(len(pieces)):
+            for right in range(left + 1, len(pieces)):
+                (a_low, a_high), (b_low, b_high) = bounds[left], bounds[right]
+                if np.any(a_high < b_low) or np.any(b_high < a_low):
+                    continue
+                a, b = pieces[left], pieces[right]
+                if a is None or b is None:
+                    continue
+                if not _pieces_overlap(a, b, clearance=1.0e-7):
+                    continue
+                penetration = 0.0
+                for owner, other in ((a, b), (b, a)):
+                    planes = _convex_planes(owner)
+                    if not planes:
+                        continue
+                    normals = np.asarray([normal for _point, normal in planes])
+                    offsets = np.asarray(
+                        [float(normal @ point) for point, normal in planes]
+                    )
+                    depth = (
+                        offsets[None, :] - _convex_test_samples(other) @ normals.T
+                    ).min(axis=1)
+                    penetration = max(penetration, float(depth.max()))
+                if penetration <= 0.0 or penetration > limit:
+                    continue
+                index = left if a.volume <= b.volume else right
+                trimmed = _inset_convex_piece(pieces[index], penetration + 1.0e-5)
+                if len(trimmed.faces) == 0:
+                    continue
+                pieces[index] = trimmed
+                bounds[index] = (
+                    trimmed.vertices.min(axis=0),
+                    trimmed.vertices.max(axis=0),
+                )
+                changed = True
+        if not changed:
+            break
+    return pieces
+
+
+def _resolve_component_overlaps(pieces, limit=LEAF_LIMIT):
+    """Build a non-overlapping union when source components interpenetrate."""
+    accepted = []
+    for piece in sorted(pieces, key=_piece_sort_key):
+        fragments = [piece]
+        for cutter in accepted:
+            next_fragments = []
+            for fragment in fragments:
+                next_fragments.extend(_subtract_convex_fragments(fragment, cutter))
+            fragments = next_fragments
+            if not fragments:
+                break
+        accepted.extend(fragments)
+        if len(accepted) > limit:
+            return accepted, False
+    return accepted, True
+
+
+def _piece_sort_key(piece):
+    center = piece.vertices.mean(axis=0)
+    return (-piece.volume, float(center[0]), float(center[1]), float(center[2]))
+
+
+def _merge_convex_neighbours(pieces):
+    """Greedily join touching convex pieces whose union is exactly convex."""
+    pieces = {index: piece for index, piece in enumerate(pieces)}
+    bounds = {
+        index: (piece.vertices.min(axis=0), piece.vertices.max(axis=0))
+        for index, piece in pieces.items()
+    }
+    next_index = len(pieces)
+    proximity = PLANE_EPSILON * 4.0
+    candidates = {}
+
+    planes = {}
+
+    def support(index):
+        if index not in planes:
+            found = _convex_planes(pieces[index])
+            planes[index] = (
+                np.asarray([normal for _point, normal in found]).reshape((-1, 3)),
+                np.asarray([float(normal @ point) for point, normal in found]),
+            )
+        return planes[index]
+
+    def share_contact_plane(left, right):
+        normals, offsets = support(left)
+        if len(normals) == 0:
+            return True
+        distance = pieces[right].vertices @ normals.T - offsets
+        behind = distance.min(axis=0) >= -REFLEX_EPSILON
+        touching = np.abs(distance).min(axis=0) <= REFLEX_EPSILON
+        return bool(np.any(behind & touching))
+
+    def evaluate(left, right):
+        if not (
+            share_contact_plane(left, right) or share_contact_plane(right, left)
+        ):
+            return
+        a = pieces[left]
+        b = pieces[right]
+        hull = _convex_hull(np.vstack((a.vertices, b.vertices)), simplify=False)
+        if hull is None:
+            return
+        hull_volume = _signed_volume(*hull)
+        smaller_area = min(
+            float(_face_normals(a.vertices, a.faces)[1].sum()),
+            float(_face_normals(b.vertices, b.faces)[1].sum()),
+        )
+        added = hull_volume - a.volume - b.volume
+        if added > MERGE_FILM_EPSILON * smaller_area + VOLUME_ABSOLUTE_EPSILON:
+            return
+        # Every part of the merged hull surface must belong to one of the two
+        # pieces; otherwise the hull bridges empty space between them.
+        hull_vertices, hull_faces = hull
+        corners = hull_vertices[hull_faces]
+        centers = corners.mean(axis=1)
+        samples = np.vstack((centers, ((corners + centers[:, None, :]) * 0.5).reshape(-1, 3)))
+        inside = np.zeros(len(samples), dtype=bool)
+        for index in (left, right):
+            normals, offsets = support(index)
+            if len(normals) == 0:
+                continue
+            inside |= np.all(samples @ normals.T - offsets <= REFLEX_EPSILON, axis=1)
+        if np.all(inside):
+            candidates[(left, right)] = hull_volume
+
+    def touching(index):
+        low, high = bounds[index]
+        return [
+            other
+            for other, (other_low, other_high) in bounds.items()
+            if other != index
+            and np.all(low <= other_high + proximity)
+            and np.all(other_low <= high + proximity)
+        ]
+
+    for index in list(pieces):
+        for other in touching(index):
+            if other > index:
+                evaluate(index, other)
+
+    while candidates:
+        # Merge the largest resulting hull first; ties resolve by index.
+        (left, right), _volume = max(
+            candidates.items(), key=lambda item: (item[1], -item[0][0], -item[0][1])
+        )
+        merged = _hull_piece(
+            np.vstack((pieces[left].vertices, pieces[right].vertices))
+        )
+        for key in [key for key in candidates if left in key or right in key]:
+            del candidates[key]
+        if merged is None:
+            continue
+        del pieces[left], pieces[right], bounds[left], bounds[right]
+        planes.pop(left, None)
+        planes.pop(right, None)
+        pieces[next_index] = merged
+        bounds[next_index] = (merged.vertices.min(axis=0), merged.vertices.max(axis=0))
+        for other in touching(next_index):
+            evaluate(other, next_index)
+        next_index += 1
+    return [pieces[index] for index in sorted(pieces)]
+
+
+def _surface_samples(vertices, faces, divisions=4):
+    """Grid samples on every triangle with the triangle's outward normal."""
+    corners = vertices[faces]
+    normals, areas = _face_normals(vertices, faces)
+    keep = areas > 1.0e-8
+    corners = corners[keep]
+    normals = normals[keep]
+    samples = []
+    sample_normals = []
+    for a in range(divisions + 1):
+        for b in range(divisions + 1 - a):
+            wa = a / divisions
+            wb = b / divisions
+            samples.append(
+                corners[:, 0] * (1.0 - wa - wb)
+                + corners[:, 1] * wa
+                + corners[:, 2] * wb
+            )
+            sample_normals.append(normals)
+    return np.vstack(samples), np.vstack(sample_normals)
+
+
+def _merge_within_tolerance(pieces, source_bvh, origin, tolerance, thin_limit=0.0):
+    """Join neighbouring convex pieces whose hull only adds shallow empty space.
+
+    Exact cuts leave pieces that were separated by planes needed elsewhere.
+    Two pieces merge into their hull when every part of the hull outside both
+    pieces lies in empty space outside the source and no deeper than the
+    feature tolerance, so the hull never covers another piece or an opening.
+    A slab thinner than the thin-part threshold is an artefact of a cut along
+    a nearly parallel plane, not a feature, so absorbing it may bridge up to
+    that threshold. Cheapest merges run first.
+    """
+    pieces = dict(enumerate(pieces))
+    cache = {}
+
+    def details(index):
+        if index not in cache:
+            piece = pieces[index]
+            planes = _convex_planes(piece)
+            cache[index] = (
+                np.asarray([normal for _point, normal in planes]).reshape((-1, 3)),
+                np.asarray([float(normal @ point) for point, normal in planes]),
+                float(_face_normals(piece.vertices, piece.faces)[1].sum()),
+                _surface_bvh(piece.vertices - origin, piece.faces),
+                piece.vertices.min(axis=0),
+                piece.vertices.max(axis=0),
+            )
+        return cache[index]
+
+    def neighbours(index):
+        low, high = details(index)[4:6]
+        return [
+            other
+            for other in pieces
+            if other != index
+            and np.all(low <= details(other)[5] + tolerance)
+            and np.all(details(other)[4] <= high + tolerance)
+        ]
+
+    def cost(left, right):
+        left_normals, left_offsets, left_area, left_bvh = details(left)[:4]
+        right_normals, right_offsets, right_area, right_bvh = details(right)[:4]
+        a = pieces[left]
+        b = pieces[right]
+        depth_limit = tolerance
+        if thin_limit > tolerance and min(
+            _minimum_width(a), _minimum_width(b)
+        ) < thin_limit:
+            depth_limit = thin_limit
+        # Only pieces that actually touch may be bridged: an air gap between
+        # separate objects must survive as a gap.
+        contact = min(
+            (
+                float(hit[3])
+                for hit in (
+                    right_bvh.find_nearest(Vector(tuple(point - origin)))
+                    for point in a.vertices
+                )
+                if hit[0] is not None
+            ),
+            default=math.inf,
+        )
+        if contact > PLANE_EPSILON * 10.0:
+            return None
+        hull = _convex_hull(np.vstack((a.vertices, b.vertices)), simplify=False)
+        if hull is None:
+            return None
+        added = _signed_volume(*hull) - a.volume - b.volume
+        if added > tolerance * min(left_area, right_area) + VOLUME_ABSOLUTE_EPSILON:
+            return None
+        samples, sample_normals = _surface_samples(*hull)
+        inside = np.zeros(len(samples), dtype=bool)
+        for normals, offsets in (
+            (left_normals, left_offsets),
+            (right_normals, right_offsets),
+        ):
+            if len(normals):
+                inside |= np.all(samples @ normals.T - offsets <= REFLEX_EPSILON, axis=1)
+        for point, normal in zip(samples[~inside] - origin, sample_normals[~inside]):
+            local = Vector(tuple(point))
+            # Depth of the bridged space measured into the hull: a shallow
+            # step is hit within the tolerance, a slot or an air gap is not.
+            direction = Vector(tuple(-normal))
+            depth = min(
+                (
+                    float(hit[3])
+                    for hit in (
+                        left_bvh.ray_cast(local, direction, depth_limit),
+                        right_bvh.ray_cast(local, direction, depth_limit),
+                    )
+                    if hit[0] is not None
+                ),
+                default=math.inf,
+            )
+            if depth == math.inf:
+                # The ray grazes along the seam of two pieces of one wall;
+                # fall back to the distance to the nearest of the two.
+                depth = min(
+                    (
+                        float(hit[3])
+                        for hit in (
+                            left_bvh.find_nearest(local),
+                            right_bvh.find_nearest(local),
+                        )
+                        if hit[0] is not None
+                    ),
+                    default=math.inf,
+                )
+            if depth > depth_limit:
+                return None
+            if depth > PLANE_EPSILON and _inside_source(source_bvh, point):
+                # The hull would cover material of another piece.
+                return None
+        return added
+
+    queue = []
+    for index in list(pieces):
+        for other in neighbours(index):
+            if other > index:
+                value = cost(index, other)
+                if value is not None:
+                    queue.append((value, index, other))
+    next_index = len(pieces)
+    while queue:
+        queue.sort(key=lambda item: item[0])
+        value, left, right = queue.pop(0)
+        if left not in pieces or right not in pieces:
+            continue
+        merged = _hull_piece(
+            np.vstack((pieces[left].vertices, pieces[right].vertices))
+        )
+        if merged is None or not merged.closed:
+            continue
+        for index in (left, right):
+            del pieces[index]
+            cache.pop(index, None)
+        queue = [item for item in queue if left not in item[1:] and right not in item[1:]]
+        pieces[next_index] = merged
+        for other in neighbours(next_index):
+            value = cost(other, next_index)
+            if value is not None:
+                queue.append((value, other, next_index))
+        next_index += 1
+    return [pieces[index] for index in sorted(pieces)]
+
+
+def _minimum_width(piece):
+    planes = _convex_planes(piece)
+    if not planes or len(piece.vertices) < 4:
+        return 0.0
+    widths = [
+        float(np.ptp(piece.vertices @ normal)) for _point, normal in planes
+    ]
+    return min(widths)
+
+
+def _hull_width(piece):
+    """Minimum width of the convex hull of any piece."""
+    hull = _convex_hull(piece.vertices, simplify=False)
+    if hull is None:
+        return 0.0
+    return _minimum_width(Piece(vertices=hull[0], faces=hull[1]))
 
 
 def _principal_extents(points):
-    """Return orientation-independent extents from largest to smallest."""
     points = np.asarray(points, dtype=np.float64)
     if len(points) < 3:
         return np.zeros(3, dtype=np.float64)
@@ -237,1314 +2102,455 @@ def _principal_extents(points):
     return np.sort(extents)[::-1]
 
 
-def _significant_concave_edges(bm, tolerance):
-    """Ignore connected reflex features whose narrow dimension is in tolerance."""
-    bm.edges.index_update()
-    remaining = {
-        edge
-        for edge in bm.edges
-        if (
-            edge.is_manifold
-            and edge.calc_face_angle_signed() < -CONCAVE_EPSILON
-        )
-    }
-    significant = []
-    while remaining:
-        seed = min(remaining, key=lambda edge: edge.index)
-        remaining.remove(seed)
-        stack = [seed]
-        group = [seed]
-        while stack:
-            edge = stack.pop()
-            for vertex in edge.verts:
-                for neighbour in vertex.link_edges:
-                    if neighbour in remaining:
-                        remaining.remove(neighbour)
-                        stack.append(neighbour)
-                        group.append(neighbour)
-
-        points = np.asarray(
-            [
-                tuple(vertex.co)
-                for edge in group
-                for vertex in edge.verts
-            ],
-            dtype=np.float64,
-        )
-        extents = _principal_extents(
-            np.unique(np.round(points, decimals=8), axis=0)
-        )
-        extent_epsilon = max(tolerance * 1.0e-4, 1.0e-7)
-        nonzero = extents[extents > extent_epsilon]
-        narrow_feature = (
-            len(group) >= 4
-            and len(nonzero) >= 2
-            and float(nonzero.min()) <= tolerance
-        )
-        if not narrow_feature:
-            significant.extend(group)
-    return significant
-
-
-def _candidate_planes(piece, rng, tolerance):
-    bm = _new_bmesh(piece.vertices, piece.faces)
-    try:
-        candidates = {}
-        significant_edges = _significant_concave_edges(bm, tolerance)
-        if not significant_edges:
-            # The dense hull check is authoritative. If a nominally narrow
-            # feature still cannot be bridged inside tolerance, retain an
-            # exact fallback instead of leaving the component unsplittable.
-            significant_edges = [
-                edge
-                for edge in bm.edges
-                if (
-                    edge.is_manifold
-                    and edge.calc_face_angle_signed() < -CONCAVE_EPSILON
-                )
-            ]
-        if len(significant_edges) >= 3:
-            # Reflex-edge midpoints describe the centre of an architectural
-            # opening much better than the vertex centroid of its surrounding
-            # wall, especially for asymmetrical rings and arches.
-            component_center = np.mean(
-                [
-                    np.asarray(
-                        tuple((edge.verts[0].co + edge.verts[1].co) * 0.5),
-                        dtype=np.float64,
-                    )
-                    for edge in significant_edges
-                ],
-                axis=0,
-            )
-        else:
-            component_center = np.asarray(
-                piece.vertices.mean(axis=0),
-                dtype=np.float64,
-            )
-        for edge in significant_edges:
-            midpoint = np.asarray(
-                tuple((edge.verts[0].co + edge.verts[1].co) * 0.5),
-                dtype=np.float64,
-            )
-            normals = [
-                np.asarray(tuple(face.normal), dtype=np.float64)
-                for face in edge.link_faces
-            ]
-            if len(normals) == 2:
-                normals.extend(
-                    (
-                        normals[0] + normals[1],
-                        normals[0] - normals[1],
-                    )
-                )
-            edge_direction = np.asarray(
-                tuple(edge.verts[1].co - edge.verts[0].co),
-                dtype=np.float64,
-            )
-            edge_direction /= max(
-                float(np.linalg.norm(edge_direction)),
-                1.0e-12,
-            )
-            center_direction = component_center - midpoint
-            # For ring, arch and frame-like parts this creates a radial plane
-            # through the opening centre and the full reflex edge. Paired
-            # front/back corners then converge on one intentional cut instead
-            # of producing a fan of small wedges.
-            normals.append(
-                np.cross(edge_direction, center_direction)
-            )
-            # Project world axes onto the space perpendicular to the reflex
-            # edge. Every candidate plane therefore contains the complete
-            # edge instead of merely passing through its midpoint.
-            for axis in np.eye(3, dtype=np.float64):
-                normals.append(
-                    axis - edge_direction * float(np.dot(axis, edge_direction))
-                )
-            for normal in normals:
-                canonical = _canonical_plane(midpoint, normal)
-                if canonical is None:
-                    continue
-                key, canonical_normal, offset = canonical
-                candidates[key] = (
-                    canonical_normal * offset,
-                    canonical_normal,
-                )
-        ordered = [candidates[key] for key in sorted(candidates)]
-        rng.shuffle(ordered)
-        return ordered
-    finally:
-        bm.free()
-
-
-def _cut_half(piece, plane_point, plane_normal, keep_positive, gap):
-    bm = _new_bmesh(piece.vertices, piece.faces)
-    try:
-        half_gap = gap * 0.5
-        shifted_point = (
-            np.asarray(plane_point, dtype=np.float64)
-            + np.asarray(plane_normal, dtype=np.float64)
-            * (half_gap if keep_positive else -half_gap)
-        )
-        result = bmesh.ops.bisect_plane(
-            bm,
-            geom=bm.verts[:] + bm.edges[:] + bm.faces[:],
-            dist=1.0e-7,
-            plane_co=Vector(tuple(shifted_point)),
-            plane_no=Vector(tuple(plane_normal)),
-            use_snap_center=False,
-            clear_inner=keep_positive,
-            clear_outer=not keep_positive,
-        )
-        # The operator's geom_cut list can omit pre-existing edges that already
-        # lie on the cutting plane. Because every input piece is closed, every
-        # boundary edge after clearing a half belongs to a cut contour.
-        cut_edges = [
-            edge
-            for edge in bm.edges
-            if edge.is_valid and edge.is_boundary
-        ]
-        if cut_edges:
-            try:
-                bmesh.ops.holes_fill(
-                    bm,
-                    edges=cut_edges,
-                    sides=0,
-                )
-            except RuntimeError:
-                pass
-
-            remaining_boundary = [
-                edge
-                for edge in bm.edges
-                if edge.is_valid and edge.is_boundary
-            ]
-            if remaining_boundary:
-                try:
-                    prepared = bmesh.ops.edgenet_prepare(
-                        bm,
-                        edges=remaining_boundary,
-                    )
-                    prepared_edges = list(prepared.get("edges", ()))
-                    bmesh.ops.edgenet_fill(
-                        bm,
-                        edges=list(
-                            set(remaining_boundary + prepared_edges)
-                        ),
-                        sides=0,
-                    )
-                except RuntimeError:
-                    pass
-
-        vertices, faces = _bmesh_arrays(bm, simplify=True)
-        child = Piece(
-            vertices=vertices,
-            faces=faces,
-            depth=piece.depth + 1,
-            allow_tolerance_hull=piece.allow_tolerance_hull,
-            approximation_deviation=piece.approximation_deviation,
-            relaxed_splits=piece.relaxed_splits,
-        )
-        return _analyse_piece(child)
-    finally:
-        bm.free()
-
-
-def _split_score(children, parent):
-    unresolved_concavity_volumes = [
-        child.concavity_volume
-        for child in children
-        if not child.convex
-    ]
-    total_concavity_volume = sum(unresolved_concavity_volumes)
-    total_concavity = sum(child.concave_edges for child in children)
-    maximum_concavity = max(
-        (child.concave_edges for child in children),
-        default=0,
-    )
-    smaller_fraction = min(
-        (child.volume for child in children),
-        default=0.0,
-    ) / max(parent.volume, 1.0e-12)
-    # On ordinary architectural solids, removing reflex edges directly keeps
-    # doors, steps and facade corners stable. Closed sweep components are
-    # separated into logical sectors before reaching this generic fallback.
-    return (
-        total_concavity,
-        maximum_concavity,
-        total_concavity_volume / max(parent.volume, 1.0e-12),
-        len(children),
-        -smaller_fraction,
-        sum(len(child.faces) for child in children),
-    )
-
-
-def _split_volume_allowance(piece, gap):
-    """Return the maximum numerical and intentional gap volume per split."""
-    extents = np.maximum(
-        piece.vertices.max(axis=0) - piece.vertices.min(axis=0),
-        1.0e-8,
-    )
-    maximum_section_area = max(
-        extents[0] * extents[1],
-        extents[1] * extents[2],
-        extents[0] * extents[2],
-    )
-    return max(
-        CONVEX_VOLUME_ABSOLUTE_EPSILON,
-        gap * maximum_section_area * 3.0,
-        piece.volume * 1.0e-6,
-    )
-
-
-def _normalize_gap_scale_concavity(piece, gap):
-    """Replace only gap-scale reflex noise with its numerically stable hull."""
-    if (
-        piece.convex
-        or not piece.closed
-        or piece.concavity_volume > _split_volume_allowance(piece, gap)
-    ):
-        return piece
-    hull = _as_convex_hull_piece(piece)
-    return hull if hull is not None else piece
-
-
-def _cut_half_components(
-    piece,
-    plane_point,
-    plane_normal,
-    keep_positive,
-    gap,
-):
-    combined = _cut_half(
-        piece,
-        plane_point,
-        plane_normal,
-        keep_positive,
-        gap,
-    )
-    if not combined.closed or len(combined.faces) == 0:
-        return []
-    components = _component_pieces(combined.vertices, combined.faces)
-    for child in components:
-        child.depth = combined.depth
-        child.relaxed_splits = piece.relaxed_splits
-    return components
-
-
-def _merge_split_children(children, gap):
-    """Collapse locally redundant split children before candidate scoring."""
-    children = list(children)
-    while True:
-        best = None
-        bounds = [
-            (child.vertices.min(axis=0), child.vertices.max(axis=0))
-            for child in children
-        ]
-        for left_index in range(len(children)):
-            for right_index in range(left_index + 1, len(children)):
-                left = children[left_index]
-                right = children[right_index]
-                left_minimum, left_maximum = bounds[left_index]
-                right_minimum, right_maximum = bounds[right_index]
-                proximity = gap * 4.0 + 1.0e-7
-                if np.any(
-                    (left_maximum + proximity < right_minimum)
-                    | (right_maximum + proximity < left_minimum)
-                ):
-                    continue
-                hull = _convex_hull(
-                    np.vstack((left.vertices, right.vertices))
-                )
-                if hull is None:
-                    continue
-                merged = _analyse_piece(
-                    Piece(
-                        vertices=hull[0],
-                        faces=hull[1],
-                        depth=max(left.depth, right.depth),
-                    )
-                )
-                points = np.vstack((left.vertices, right.vertices))
-                extents = np.maximum(
-                    points.max(axis=0) - points.min(axis=0),
-                    1.0e-8,
-                )
-                maximum_face_area = max(
-                    extents[0] * extents[1],
-                    extents[1] * extents[2],
-                    extents[0] * extents[2],
-                )
-                allowance = max(
-                    1.0e-7,
-                    gap * maximum_face_area * 2.5,
-                    (left.volume + right.volume) * 1.0e-6,
-                )
-                added_volume = max(
-                    0.0,
-                    merged.volume - left.volume - right.volume,
-                )
-                if added_volume > allowance:
-                    continue
-                candidate = (
-                    added_volume / allowance,
-                    left_index,
-                    right_index,
-                    merged,
-                )
-                if best is None or candidate[0] < best[0]:
-                    best = candidate
-        if best is None:
-            return children
-        _, left_index, right_index, merged = best
-        children = [
-            child
-            for index, child in enumerate(children)
-            if index not in {left_index, right_index}
-        ]
-        children.append(merged)
-
-
-def _best_exact_split(piece, gap, tolerance, rng):
-    candidates = []
-    minimum_volume = max(piece.volume * 1.0e-5, 1.0e-9)
-    for plane_point, plane_normal in _candidate_planes(
-        piece,
-        rng,
-        tolerance,
-    ):
-        negative = _cut_half_components(
-            piece,
-            plane_point,
-            plane_normal,
-            keep_positive=False,
-            gap=gap,
-        )
-        positive = _cut_half_components(
-            piece,
-            plane_point,
-            plane_normal,
-            keep_positive=True,
-            gap=gap,
-        )
-        children = [
-            _normalize_gap_scale_concavity(child, gap)
-            for child in negative + positive
-        ]
-        children = _merge_split_children(children, gap)
-        if len(children) < 2:
-            continue
-        if any(
-            not child.closed or child.volume <= minimum_volume
-            for child in children
-        ):
-            continue
-        # Reject any candidate that silently loses an open half after the
-        # bisect/cap operation. This is essential for large connected models:
-        # a valid-looking set of convex remnants must never replace only part
-        # of the parent volume.
-        child_volume = sum(child.volume for child in children)
-        if abs(child_volume - piece.volume) > _split_volume_allowance(
-            piece,
-            gap,
-        ):
-            continue
-        child_concavity = sum(
-            child.concave_edges
-            for child in children
-            if not child.convex
-        )
-        child_concavity_volume = sum(
-            child.concavity_volume
-            for child in children
-            if not child.convex
-        )
-        concavity_allowance = _split_volume_allowance(piece, gap)
-        if child_concavity_volume > (
-            piece.concavity_volume + concavity_allowance
-        ):
-            continue
-        if (
-            child_concavity_volume
-            >= piece.concavity_volume - concavity_allowance
-            and child_concavity > piece.concave_edges
-        ):
-            continue
-        score = _split_score(children, piece)
-        candidates.append((score, children))
-
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0])
-    return tuple(candidates[0][1])
-
-
-def _convex_hull(vertices):
-    unique = np.unique(np.round(vertices, decimals=8), axis=0)
-    if len(unique) < 4:
-        return None
-    bm = bmesh.new()
-    try:
-        bm_vertices = [bm.verts.new(tuple(point)) for point in unique]
-        bmesh.ops.convex_hull(
-            bm,
-            input=bm_vertices,
-            use_existing_faces=False,
-        )
-        hull_vertices, hull_faces = _bmesh_arrays(bm, simplify=True)
-        if len(hull_faces) < 4:
-            return None
-        return hull_vertices, hull_faces
-    finally:
-        bm.free()
-
-
-def _as_convex_hull_piece(piece):
-    hull = _convex_hull(piece.vertices)
-    if hull is None:
-        return None
-    vertices, faces = hull
-    return _analyse_piece(
-        Piece(
-            vertices=vertices,
-            faces=faces,
-            depth=piece.depth,
-            approximate_open_shell=piece.approximate_open_shell,
-            allow_tolerance_hull=piece.allow_tolerance_hull,
-            approximation_deviation=piece.approximation_deviation,
-        )
-    )
-
-
-def _surface_deviation(
-    hull_vertices,
-    hull_faces,
-    source_vertices,
-    source_faces,
-    sample_spacing=None,
-    stop_at=None,
-):
-    source_bvh = BVHTree.FromPolygons(
-        [Vector(tuple(point)) for point in source_vertices],
-        [tuple(int(index) for index in triangle) for triangle in source_faces],
-        all_triangles=True,
-        epsilon=0.0,
-    )
-    worst = 0.0
-    for triangle in hull_faces:
-        a, b, c = hull_vertices[triangle]
-        if sample_spacing is None:
-            samples = (a, b, c, (a + b + c) / 3.0)
-        else:
-            maximum_edge = max(
-                float(np.linalg.norm(a - b)),
-                float(np.linalg.norm(b - c)),
-                float(np.linalg.norm(c - a)),
-            )
-            divisions = min(
-                64,
-                max(2, int(math.ceil(maximum_edge / sample_spacing))),
-            )
-            samples = (
-                a + (b - a) * (left / divisions)
-                + (c - a) * (right / divisions)
-                for left in range(divisions + 1)
-                for right in range(divisions + 1 - left)
-            )
-        for point in samples:
-            hit = source_bvh.find_nearest(Vector(tuple(point)))
-            if hit[0] is not None:
-                worst = max(worst, float(hit[3]))
-                if stop_at is not None and worst > stop_at:
-                    return worst
-    return worst
-
-
-def _approximate_convex_piece(piece, tolerance):
-    """Connect existing points when one hull stays inside the user tolerance."""
-    if piece.convex or not piece.closed:
-        return piece, 0.0
-    bm = _new_bmesh(piece.vertices, piece.faces)
-    try:
-        significant_edges = _significant_concave_edges(bm, tolerance)
-    finally:
-        bm.free()
-    if significant_edges and not piece.allow_tolerance_hull:
-        # Exterior steps and broad corners must remain exact even when the
-        # diagonal of one small step happens to fit inside the tolerance.
-        # Hull approximation is reserved for enclosed narrow recesses.
-        return None, math.inf
-    hull = _convex_hull(piece.vertices)
-    if hull is None:
-        return None, math.inf
-    hull_vertices, hull_faces = hull
-
-    # The cheap pass rejects clearly concave parts before dense sampling.
-    deviation = _surface_deviation(
-        hull_vertices,
-        hull_faces,
-        piece.vertices,
-        piece.faces,
-        stop_at=tolerance,
-    )
-    if deviation > tolerance:
-        return None, deviation
-
-    # A tolerance-spaced lattice catches large doors and windows while narrow
-    # slots below tolerance are intentionally bridged by the hull.
-    deviation = _surface_deviation(
-        hull_vertices,
-        hull_faces,
-        piece.vertices,
-        piece.faces,
-        sample_spacing=max(tolerance * 0.5, 0.005),
-        stop_at=tolerance,
-    )
-    if deviation > tolerance:
-        return None, deviation
-
-    approximated = _analyse_piece(
-        Piece(
-            vertices=hull_vertices,
-            faces=hull_faces,
-            depth=piece.depth,
-            approximate_open_shell=piece.approximate_open_shell,
-            allow_tolerance_hull=piece.allow_tolerance_hull,
-            approximation_deviation=max(
-                piece.approximation_deviation,
-                deviation,
-            ),
-        )
-    )
-    return approximated, deviation
-
-
-def _close_small_open_piece(piece, tolerance):
-    hull = _convex_hull(piece.vertices)
-    if hull is None:
-        return None, math.inf
-    hull_vertices, hull_faces = hull
-    deviation = _surface_deviation(
-        hull_vertices,
-        hull_faces,
-        piece.vertices,
-        piece.faces,
-    )
-    if deviation > tolerance:
-        return None, deviation
-    closed = Piece(
-        vertices=hull_vertices,
-        faces=hull_faces,
-        depth=piece.depth,
-        approximate_open_shell=True,
-    )
-    return _analyse_piece(closed), deviation
-
-
-def _ordered_cycle(edges):
-    adjacency = {}
-    for edge in edges:
-        left, right = (vertex.index for vertex in edge.verts)
-        adjacency.setdefault(left, []).append(right)
-        adjacency.setdefault(right, []).append(left)
-    if len(adjacency) < 3 or any(
-        len(neighbours) != 2
-        for neighbours in adjacency.values()
-    ):
-        return None
-
-    start = min(adjacency)
-    order = [start]
-    previous = None
-    current = start
-    while len(order) < len(adjacency):
-        candidates = [
-            neighbour
-            for neighbour in adjacency[current]
-            if neighbour != previous and neighbour not in order
-        ]
-        if not candidates:
-            return None
-        previous, current = current, min(candidates)
-        order.append(current)
-    if start not in adjacency[current]:
-        return None
-    return order
-
-
-def _repeated_cross_section_cycles(bm, tolerance):
-    """Detect a closed sweep made from repeated equal cross-section loops."""
-    bm.verts.index_update()
-    bm.edges.index_update()
-    if len(bm.verts) < 12 or len(bm.verts) - len(bm.edges) + len(bm.faces) != 0:
-        return None
-
-    lengths = sorted(
-        ((float(edge.calc_length()), edge) for edge in bm.edges),
-        key=lambda item: item[0],
-    )
-    median_length = lengths[len(lengths) // 2][0]
-    length_epsilon = max(
-        tolerance * 0.02,
-        median_length * 1.0e-4,
-        1.0e-6,
-    )
-    clusters = []
-    for length, edge in lengths:
-        if (
-            not clusters
-            or abs(length - clusters[-1]["mean"]) > length_epsilon
-        ):
-            clusters.append(
-                {
-                    "mean": length,
-                    "edges": [edge],
-                }
-            )
-        else:
-            cluster = clusters[-1]
-            cluster["edges"].append(edge)
-            cluster["mean"] = sum(
-                float(item.calc_length())
-                for item in cluster["edges"]
-            ) / len(cluster["edges"])
-
-    for cluster in sorted(
-        clusters,
-        key=lambda item: len(item["edges"]),
-        reverse=True,
-    ):
-        if len(cluster["edges"]) < 9:
-            continue
-        remaining = set(cluster["edges"])
-        cycles = []
-        while remaining:
-            seed = min(remaining, key=lambda edge: edge.index)
-            remaining.remove(seed)
-            stack = [seed]
-            component = [seed]
-            while stack:
-                edge = stack.pop()
-                for vertex in edge.verts:
-                    for neighbour in vertex.link_edges:
-                        if neighbour in remaining:
-                            remaining.remove(neighbour)
-                            stack.append(neighbour)
-                            component.append(neighbour)
-            cycle = _ordered_cycle(component)
-            if cycle is None:
-                cycles = []
-                break
-            cycles.append(cycle)
-
-        if len(cycles) < 3:
-            continue
-        cycle_size = len(cycles[0])
-        if cycle_size < 3 or any(
-            len(cycle) != cycle_size
-            for cycle in cycles
-        ):
-            continue
-        covered_vertices = {
-            vertex_index
-            for cycle in cycles
-            for vertex_index in cycle
-        }
-        if (
-            len(covered_vertices) != len(bm.verts)
-            or sum(len(cycle) for cycle in cycles) != len(bm.verts)
-        ):
-            continue
-
-        cycle_sets = [set(cycle) for cycle in cycles]
-        neighbours = {index: set() for index in range(len(cycles))}
-        pairs = []
-        for left_index in range(len(cycles)):
-            for right_index in range(left_index + 1, len(cycles)):
-                left = cycle_sets[left_index]
-                right = cycle_sets[right_index]
-                connecting_edges = sum(
-                    (
-                        edge.verts[0].index in left
-                        and edge.verts[1].index in right
-                    )
-                    or (
-                        edge.verts[1].index in left
-                        and edge.verts[0].index in right
-                    )
-                    for edge in bm.edges
-                )
-                if connecting_edges >= cycle_size:
-                    neighbours[left_index].add(right_index)
-                    neighbours[right_index].add(left_index)
-                    pairs.append((left_index, right_index))
-        if (
-            len(pairs) == len(cycles)
-            and all(len(items) == 2 for items in neighbours.values())
-        ):
-            return cycles, pairs
-    return None
-
-
-def _ring_sector_piece(piece, left_cycle, right_cycle):
-    left = set(left_cycle)
-    right = set(right_cycle)
-    combined = left | right
-    side_faces = [
-        triangle
-        for triangle in piece.faces
-        if (
-            set(int(index) for index in triangle).issubset(combined)
-            and any(int(index) in left for index in triangle)
-            and any(int(index) in right for index in triangle)
-        )
-    ]
-    if len(side_faces) < len(left_cycle) * 2:
-        return None
-
-    used = sorted(combined)
-    remap = {old: new for new, old in enumerate(used)}
-    remapped_faces = np.asarray(
-        [
-            [remap[int(index)] for index in triangle]
-            for triangle in side_faces
-        ],
-        dtype=np.int32,
-    )
-    bm = _new_bmesh(piece.vertices[used], remapped_faces)
-    try:
-        boundary_edges = [edge for edge in bm.edges if edge.is_boundary]
-        if not boundary_edges:
-            return None
-        try:
-            bmesh.ops.holes_fill(
-                bm,
-                edges=boundary_edges,
-                sides=0,
-            )
-        except RuntimeError:
-            return None
-        vertices, faces = _bmesh_arrays(bm)
-    finally:
-        bm.free()
-    sector = _analyse_piece(
-        Piece(
-            vertices=vertices,
-            faces=faces,
-            depth=piece.depth,
-            allow_tolerance_hull=True,
-        )
-    )
-    return sector if sector.closed else None
-
-
-def _ring_hull_external_deviation(
-    hull,
-    source_piece,
-    left_points,
-    right_points,
-    tolerance,
-    stop_at=None,
-):
-    hull_vertices, hull_faces = hull
-    source_bvh = _piece_bvh(source_piece)
-    worst = 0.0
-    for triangle in hull_faces:
-        a, b, c = hull_vertices[triangle]
-        ring_labels = []
-        for point in (a, b, c):
-            distances = (
-                float(np.min(np.linalg.norm(left_points - point, axis=1))),
-                float(np.min(np.linalg.norm(right_points - point, axis=1))),
-            )
-            ring_labels.append(int(np.argmin(distances)))
-        # End caps are intentional internal partition faces.
-        if len(set(ring_labels)) == 1:
-            continue
-
-        maximum_edge = max(
-            float(np.linalg.norm(a - b)),
-            float(np.linalg.norm(b - c)),
-            float(np.linalg.norm(c - a)),
-        )
-        divisions = min(
-            64,
-            max(2, int(math.ceil(maximum_edge / max(tolerance * 0.5, 0.005)))),
-        )
-        for left in range(divisions + 1):
-            for right in range(divisions + 1 - left):
-                point = (
-                    a
-                    + (b - a) * (left / divisions)
-                    + (c - a) * (right / divisions)
-                )
-                hit = source_bvh.find_nearest(Vector(tuple(point)))
-                if hit[0] is not None:
-                    worst = max(worst, float(hit[3]))
-                    if stop_at is not None and worst > stop_at:
-                        return worst
-    return worst
-
-
-def _ring_sweep_decomposition(piece, tolerance, gap):
-    """Return logical tube sectors for a repeated closed sweep, if detected."""
-    if not piece.closed or piece.convex:
-        return None
-    bm = _new_bmesh(piece.vertices, piece.faces)
-    try:
-        detected = _repeated_cross_section_cycles(bm, tolerance)
-    finally:
-        bm.free()
-    if detected is None:
-        return None
-    cycles, pairs = detected
-
-    sectors = []
-    for left_index, right_index in pairs:
-        left_cycle = cycles[left_index]
-        right_cycle = cycles[right_index]
-        sector = _ring_sector_piece(
-            piece,
-            left_cycle,
-            right_cycle,
-        )
-        if sector is None:
-            return None
-        hull = _convex_hull(sector.vertices)
-        if hull is None:
-            return None
-        deviation = _ring_hull_external_deviation(
-            hull,
-            piece,
-            piece.vertices[left_cycle],
-            piece.vertices[right_cycle],
-            tolerance,
-            stop_at=tolerance * 1.10,
-        )
-        if deviation > tolerance:
-            # A twisted quad can make the point hull bow outside the source.
-            # Search for the smallest conservative inset instead of creating
-            # four tiny BSP wedges. Under-coverage is capped by the same user
-            # tolerance and is verified later by source coverage sampling.
-            center = hull[0].mean(axis=0)
-            original_hull = hull
-            for inset_distance in np.linspace(
-                max(gap * 2.0, tolerance * 0.05),
-                tolerance,
-                12,
-            ):
-                directions = center - original_hull[0]
-                lengths = np.linalg.norm(directions, axis=1)
-                inset_vertices = original_hull[0] + directions * (
-                    inset_distance / np.maximum(lengths, 1.0e-12)
-                )[:, None]
-                inset_hull = _convex_hull(inset_vertices)
-                if inset_hull is None:
-                    continue
-                inset_deviation = _ring_hull_external_deviation(
-                    inset_hull,
-                    piece,
-                    piece.vertices[left_cycle],
-                    piece.vertices[right_cycle],
-                    tolerance,
-                    stop_at=tolerance,
-                )
-                if inset_deviation <= tolerance:
-                    hull = inset_hull
-                    deviation = max(inset_deviation, inset_distance)
-                    break
-        if deviation <= tolerance:
-            sector = _analyse_piece(
-                Piece(
-                    vertices=hull[0],
-                    faces=hull[1],
-                    depth=piece.depth,
-                    allow_tolerance_hull=True,
-                    approximation_deviation=deviation,
-                )
-            )
-        sectors.append(sector)
-
-    if abs(sum(sector.volume for sector in sectors) - piece.volume) > max(
-        _split_volume_allowance(piece, gap),
-        piece.volume * 1.0e-5,
-    ):
-        # Hull sectors may contain a little extra volume; validate the exact
-        # sector partition instead of rejecting a sound topology detection.
-        exact_volume = 0.0
-        for left_index, right_index in pairs:
-            exact_sector = _ring_sector_piece(
-                piece,
-                cycles[left_index],
-                cycles[right_index],
-            )
-            if exact_sector is None:
-                return None
-            exact_volume += exact_sector.volume
-        if abs(exact_volume - piece.volume) > _split_volume_allowance(piece, gap):
-            return None
-    return sectors
-
-
-def _convex_planes(piece):
-    """Return unique outward face planes of a closed convex piece."""
-    bm = _new_bmesh(piece.vertices, piece.faces)
-    try:
-        planes = {}
-        for face in bm.faces:
-            point = np.asarray(tuple(face.verts[0].co), dtype=np.float64)
-            normal = np.asarray(tuple(face.normal), dtype=np.float64)
-            canonical = _canonical_plane(point, normal)
-            if canonical is None:
-                continue
-            key, canonical_normal, offset = canonical
-            # Canonicalization is only used for deduplication. Preserve the
-            # original outward direction for half-space classification.
-            planes[key] = (point, normal / max(np.linalg.norm(normal), 1.0e-12))
-        return list(planes.values())
-    finally:
-        bm.free()
-
-
-def _piece_bvh(piece):
-    return BVHTree.FromPolygons(
-        [Vector(tuple(point)) for point in piece.vertices],
-        [tuple(int(index) for index in triangle) for triangle in piece.faces],
-        all_triangles=True,
-        epsilon=1.0e-8,
-    )
-
-
-def _point_inside_convex(point, planes, epsilon=1.0e-7):
-    point = np.asarray(point, dtype=np.float64)
-    return all(
-        float(np.dot(point - plane_point, plane_normal)) <= epsilon
-        for plane_point, plane_normal in planes
-    )
-
-
-def _convex_test_samples(piece):
-    centroids = piece.vertices[piece.faces].mean(axis=1)
-    edge_indices = set()
-    for triangle in piece.faces:
-        for left, right in (
-            (triangle[0], triangle[1]),
-            (triangle[1], triangle[2]),
-            (triangle[2], triangle[0]),
-        ):
-            edge_indices.add(tuple(sorted((int(left), int(right)))))
-    edge_samples = np.asarray(
-        [
-            piece.vertices[left] * (1.0 - fraction)
-            + piece.vertices[right] * fraction
-            for left, right in sorted(edge_indices)
-            for fraction in (0.25, 0.5, 0.75)
-        ],
-        dtype=np.float64,
-    )
-    return np.vstack((piece.vertices, edge_samples, centroids))
-
-
-def _inset_convex_piece(piece, distance):
-    """Move every support plane inward by one fixed world-space distance.
-
-    Uniform scaling is not a geometric inset.  On a long, thin hull its scale
-    factor is dictated by the thinnest support distance, so a 0.1 mm clearance
-    can shorten a 55 m prism by several centimetres.  Reconstructing the
-    polyhedron from the shifted half-spaces keeps the clearance independent of
-    aspect ratio and preserves the ends of tall architectural collision parts.
-    """
-    if distance <= 0.0:
-        return piece
-    planes = _convex_planes(piece)
-    if len(planes) < 4:
-        return piece
-
-    normals = np.asarray(
-        [normal for _point, normal in planes],
-        dtype=np.float64,
-    )
-    offsets = np.asarray(
-        [float(np.dot(point, normal)) - distance for point, normal in planes],
-        dtype=np.float64,
-    )
-    epsilon = max(distance * 1.0e-5, 1.0e-9)
-    intersections = []
-    for left in range(len(planes) - 2):
-        for middle in range(left + 1, len(planes) - 1):
-            for right in range(middle + 1, len(planes)):
-                matrix = normals[[left, middle, right]]
-                determinant = float(np.linalg.det(matrix))
-                if abs(determinant) <= 1.0e-10:
-                    continue
-                point = np.linalg.solve(
-                    matrix,
-                    offsets[[left, middle, right]],
-                )
-                if np.all(normals @ point <= offsets + epsilon):
-                    intersections.append(point)
-
-    if len(intersections) < 4:
-        # The requested clearance consumed this sliver completely. Returning
-        # the pre-inset piece would reintroduce the exact zero-volume fragment
-        # the clearance operation was meant to eliminate.
-        return _analyse_piece(Piece(
-            vertices=np.empty((0, 3), dtype=np.float64),
-            faces=np.empty((0, 3), dtype=np.int32),
-            depth=piece.depth,
-        ))
-    hull = _convex_hull(np.asarray(intersections, dtype=np.float64))
-    if hull is None:
-        return _analyse_piece(Piece(
-            vertices=np.empty((0, 3), dtype=np.float64),
-            faces=np.empty((0, 3), dtype=np.int32),
-            depth=piece.depth,
-        ))
-    return _analyse_piece(
-        Piece(
-            vertices=hull[0],
-            faces=hull[1],
-            depth=piece.depth,
-            approximate_open_shell=piece.approximate_open_shell,
-            allow_tolerance_hull=piece.allow_tolerance_hull,
-            approximation_deviation=max(
-                piece.approximation_deviation,
-                distance,
-            ),
-        )
-    )
-
-
-def _pieces_overlap(subject, cutter, clearance=1.0e-6):
-    """Return true only for positive-volume overlap, not shared boundaries."""
-    cutter_planes = _convex_planes(cutter)
-    subject_planes = _convex_planes(subject)
-    return (
-        any(
-            _point_inside_convex(
-                point,
-                cutter_planes,
-                epsilon=-clearance,
-            )
-            for point in _convex_test_samples(subject)
-        )
-        or any(
-            _point_inside_convex(
-                point,
-                subject_planes,
-                epsilon=-clearance,
-            )
-            for point in _convex_test_samples(cutter)
-        )
-    )
-
-
-def _subtract_convex_fragments(subject, cutter, settings):
-    """Keep every significant convex fragment of subject outside cutter."""
-    if not _pieces_overlap(subject, cutter):
-        return [subject]
-
-    pending_inside = [subject]
-    outside_fragments = []
-    epsilon = 1.0e-7
-    for plane_point, plane_normal in _convex_planes(cutter):
-        next_inside = []
-        for fragment in pending_inside:
-            distances = (
-                fragment.vertices - np.asarray(plane_point, dtype=np.float64)
-            ) @ np.asarray(plane_normal, dtype=np.float64)
-            if float(distances.min()) >= settings.gap - epsilon:
-                outside_fragments.append(fragment)
-                continue
-            if float(distances.max()) <= epsilon:
-                next_inside.append(fragment)
-                continue
-
-            outside = _cut_half(
-                fragment,
-                plane_point,
-                plane_normal,
-                keep_positive=True,
-                gap=settings.gap * 2.0,
-            )
-            inside = _cut_half(
-                fragment,
-                plane_point,
-                plane_normal,
-                keep_positive=False,
-                gap=0.0,
-            )
-            for candidate, target in (
-                (outside, outside_fragments),
-                (inside, next_inside),
-            ):
-                if not candidate.closed or candidate.volume <= 1.0e-9:
-                    continue
-                hull = _as_convex_hull_piece(candidate)
-                if hull is None:
-                    continue
-                target.append(hull)
-
-        pending_inside = next_inside
-        if not pending_inside:
-            break
-
-    # Anything still inside every cutter plane is the overlap and is removed.
-    return outside_fragments
-
-
 def _piece_extents(piece):
-    points = piece.vertices
-    if len(points) < 2:
-        return np.zeros(3, dtype=np.float64)
-    centered = points - points.mean(axis=0)
-    try:
-        _, axes = np.linalg.eigh(centered.T @ centered)
-        projected = centered @ axes
-        return np.sort(projected.max(axis=0) - projected.min(axis=0))[::-1]
-    except np.linalg.LinAlgError:
-        return np.sort(points.max(axis=0) - points.min(axis=0))[::-1]
+    return _principal_extents(piece.vertices)
 
 
 def _is_ignorable_fragment(piece, settings):
     extents = _piece_extents(piece)
-    # A support-plane inset may collapse an extremely thin leftover into a
-    # plane.  Such a fragment is not a convex volume and would export as an
-    # invalid UCX object with duplicate vertices.
-    collapse_epsilon = max(
-        1.0e-6,
-        float(settings.gap) * 0.5 + 1.0e-7,
-    )
-    if float(extents[-1]) <= collapse_epsilon:
-        return True
-    if float(extents[0]) <= settings.min_feature:
-        return True
-    return bool(
-        settings.skip_thin
-        and float(extents[-1]) <= settings.thin_threshold
-    )
+    collapse_epsilon = max(1.0e-6, float(settings.gap) * 0.5 + 1.0e-7)
+    return float(extents[-1]) <= collapse_epsilon
 
 
-def _piece_sort_key(piece):
-    center = piece.vertices.mean(axis=0)
-    return (
-        -piece.volume,
-        float(center[0]),
-        float(center[1]),
-        float(center[2]),
-    )
-
-
-def _merge_gap_allowance(left, right, settings):
-    points = np.vstack((left.vertices, right.vertices))
-    extents = np.maximum(points.max(axis=0) - points.min(axis=0), 1.0e-8)
-    face_areas = (
-        extents[0] * extents[1],
-        extents[1] * extents[2],
-        extents[0] * extents[2],
-    )
-    return max(
-        1.0e-7,
-        settings.gap * max(face_areas) * 2.5,
-        (left.volume + right.volume) * 1.0e-6,
-    )
-
-
-def _merge_convex_neighbours(pieces, settings):
-    """Greedily remove redundant cuts whose union is still convex."""
-    pieces = list(pieces)
-    while True:
-        candidates = []
-        bounds = [
-            (piece.vertices.min(axis=0), piece.vertices.max(axis=0))
-            for piece in pieces
-        ]
-        for left_index in range(len(pieces)):
-            for right_index in range(left_index + 1, len(pieces)):
-                left = pieces[left_index]
-                right = pieces[right_index]
-                left_minimum, left_maximum = bounds[left_index]
-                right_minimum, right_maximum = bounds[right_index]
-                proximity = settings.gap * 4.0 + 1.0e-7
-                if np.any(
-                    (left_maximum + proximity < right_minimum)
-                    | (right_maximum + proximity < left_minimum)
-                ):
-                    continue
-                merged = _convex_hull(
-                    np.vstack((left.vertices, right.vertices))
-                )
-                if merged is None:
-                    continue
-                merged_piece = _analyse_piece(
-                    Piece(vertices=merged[0], faces=merged[1])
-                )
-                added_volume = max(
-                    0.0,
-                    merged_piece.volume - left.volume - right.volume,
-                )
-                allowance = _merge_gap_allowance(left, right, settings)
-                if added_volume > allowance:
-                    continue
-
-                intersects_other = any(
-                    index not in {left_index, right_index}
-                    and _pieces_overlap(merged_piece, other)
-                    for index, other in enumerate(pieces)
-                )
-                if intersects_other:
-                    continue
-                candidates.append(
-                    (
-                        added_volume / allowance,
-                        left_index,
-                        right_index,
-                        merged_piece,
-                    )
-                )
-
-        if not candidates:
-            return pieces
-        _, left_index, right_index, merged_piece = min(
-            candidates,
-            key=lambda item: item[0],
-        )
-        pieces = [
-            piece
-            for index, piece in enumerate(pieces)
-            if index not in {left_index, right_index}
-        ]
-        pieces.append(merged_piece)
-
-
-def _resolve_component_overlaps(pieces, settings):
-    """Build a non-overlapping convex union while keeping large pieces whole."""
-    accepted = []
-    normalized = []
-    for piece in pieces:
-        hull = _as_convex_hull_piece(piece)
-        if hull is not None:
-            normalized.append(hull)
-
-    for piece in sorted(normalized, key=_piece_sort_key):
-        fragments = [piece]
-        for cutter in accepted:
-            next_fragments = []
-            for fragment in fragments:
-                next_fragments.extend(
-                    _subtract_convex_fragments(
-                        fragment,
-                        cutter,
-                        settings,
-                    )
-                )
-            fragments = next_fragments
-            if not fragments:
+def _reliable_hull_planes(vertices, faces):
+    """Group hull triangles by plane into area-weighted support planes."""
+    normals, areas = _face_normals(vertices, faces)
+    groups = []
+    for face in np.argsort(-areas):
+        if areas[face] <= 1.0e-12:
+            break
+        normal = normals[face]
+        offset = float(normal @ vertices[faces[face, 0]])
+        for group in groups:
+            if float(group[0] @ normal) > 1.0 - 1.0e-7 and abs(group[1] - offset) <= 1.0e-5:
+                group[2] += normal * areas[face]
+                group[3].append(face)
                 break
-        accepted.extend(fragments)
-        if len(accepted) > settings.max_parts:
-            return accepted, False
-    return accepted, True
+        else:
+            groups.append([normal, offset, normal * areas[face], [face]])
+    planes = []
+    incident = [[] for _ in range(len(vertices))]
+    for weighted_normal, _offset, weighted, members in groups:
+        length = float(np.linalg.norm(weighted))
+        if length <= 1.0e-9:
+            continue
+        unit = weighted / length
+        corners = np.unique(faces[members].reshape(-1))
+        # The highest projection makes every plane a support plane by
+        # definition, so shifting it inward can never grow the hull.
+        offset = float((vertices @ unit).max())
+        index = len(planes)
+        planes.append((unit, offset))
+        for corner in corners:
+            incident[int(corner)].append(index)
+    return planes, incident
+
+
+def _polytope_piece(vertices, depth=0, simplify=False):
+    """Exact convex polytope of the points, triangulated facet by facet.
+
+    ``polygons`` holds the planar facets; ``faces`` holds their triangles,
+    chosen so each facet's narrowest triangle is as wide as possible, which
+    is what SINTEZ AGR Checker's face-plane convexity rule needs.
+    """
+    if simplify:
+        result = hull64.simplify_needles(
+            vertices, OUTPUT_MERGE_DISTANCE, NEEDLE_ASPECT, NEEDLE_MAX_LOSS
+        )
+        if result is None:
+            return None
+        points, polygons, faces = result
+    else:
+        result = hull64.planar_polytope(vertices, OUTPUT_MERGE_DISTANCE)
+        if result is None:
+            return None
+        points, polygons = result
+        faces = hull64.wide_triangles(points, polygons)
+    faces = np.asarray(faces, dtype=np.int32)
+    piece = Piece(vertices=points, faces=faces, depth=depth)
+    piece.polygons = polygons
+    piece.closed = True
+    piece.volume = abs(_signed_volume(points, faces))
+    return piece
+
+
+def _polytope_planes(piece):
+    """Outward unit normals and supporting offsets of a polytope's polygons."""
+    vertices = piece.vertices
+    normals = []
+    for polygon in piece.polygons:
+        points = vertices[polygon]
+        following = np.roll(points, -1, axis=0)
+        normal = np.array([
+            np.sum((points[:, 1] - following[:, 1]) * (points[:, 2] + following[:, 2])),
+            np.sum((points[:, 2] - following[:, 2]) * (points[:, 0] + following[:, 0])),
+            np.sum((points[:, 0] - following[:, 0]) * (points[:, 1] + following[:, 1])),
+        ])
+        length = float(np.linalg.norm(normal))
+        if length > 0.0:
+            normals.append(normal / length)
+    normals = np.asarray(normals).reshape((-1, 3))
+    # Supporting offsets: every vertex lies behind every plane by construction.
+    offsets = (vertices @ normals.T).max(axis=0) if len(normals) else np.empty(0)
+    return normals, offsets
+
+
+def _inset_polytope(piece, distance):
+    """Shift every face plane of a convex polytope inward by ``distance``.
+
+    The result is the intersection of the shifted half-spaces, rebuilt from
+    their exact vertices. Every point of it lies at least ``distance`` inside
+    the original, so two pieces that did not overlap end at least twice that
+    distance apart - the gap SINTEZ AGR Checker measures is then guaranteed
+    rather than approximately reached. Returns an empty piece when the shift
+    swallows the whole polytope.
+    """
+    empty = Piece(
+        vertices=np.empty((0, 3), dtype=np.float64),
+        faces=np.empty((0, 3), dtype=np.int32),
+        depth=piece.depth,
+    )
+    if distance <= 0.0:
+        return piece
+    if getattr(piece, "polygons", None) is None:
+        rebuilt = _polytope_piece(piece.vertices, piece.depth)
+        if rebuilt is None:
+            return empty
+        piece = rebuilt
+    normals, offsets = _polytope_planes(piece)
+    if len(normals) < 4:
+        return empty
+    shifted = offsets - distance
+    scale = max(float(np.abs(piece.vertices).max()), 1.0)
+    count = len(normals)
+    if count <= INSET_GLOBAL_PLANES:
+        triples = np.asarray(list(itertools.combinations(range(count), 3)), dtype=np.int64)
+    else:
+        # Only planes near each other can meet in a vertex of the inset:
+        # those of the polygons around a vertex and of their neighbours.
+        vertex_polygons = {}
+        for index, polygon in enumerate(piece.polygons):
+            for vertex in polygon:
+                vertex_polygons.setdefault(vertex, set()).add(index)
+        neighbourhood = {}
+        for vertex, owners in vertex_polygons.items():
+            ring = set(owners)
+            for owner in owners:
+                for corner in piece.polygons[owner]:
+                    ring |= vertex_polygons[corner]
+            neighbourhood[vertex] = sorted(ring)
+        rows = set()
+        for ring in neighbourhood.values():
+            rows.update(itertools.combinations(ring, 3))
+        triples = np.asarray(sorted(rows), dtype=np.int64).reshape((-1, 3))
+    if len(triples) == 0:
+        return empty
+    matrices = normals[triples]
+    determinants = np.linalg.det(matrices)
+    usable = np.abs(determinants) > 1.0e-10
+    if not usable.any():
+        return empty
+    points = np.linalg.solve(matrices[usable], shifted[triples[usable]][..., None])[..., 0]
+    inside = np.all(points @ normals.T - shifted <= scale * 1.0e-12, axis=1)
+    points = points[inside]
+    if len(points) < 4:
+        return empty
+    rebuilt = _polytope_piece(points, piece.depth)
+    return rebuilt if rebuilt is not None else empty
+
+
+def _polytope_edges(piece):
+    pairs = {
+        (min(polygon[k], polygon[(k + 1) % len(polygon)]),
+         max(polygon[k], polygon[(k + 1) % len(polygon)]))
+        for polygon in piece.polygons
+        for k in range(len(polygon))
+    }
+    return np.asarray(sorted(pairs), dtype=np.int64).reshape((-1, 2))
+
+
+def _clip_polytope(piece, normal, offset):
+    """Keep the part of a convex polytope with ``normal . x <= offset``.
+
+    The clipped polytope's corners are the kept corners plus the points where
+    edges cross the plane, so the result is exact.
+    """
+    empty = Piece(
+        vertices=np.empty((0, 3), dtype=np.float64),
+        faces=np.empty((0, 3), dtype=np.int32),
+        depth=piece.depth,
+    )
+    vertices = piece.vertices
+    distance = vertices @ normal - offset
+    if bool((distance <= 0.0).all()):
+        return piece
+    if bool((distance >= 0.0).all()):
+        return empty
+    edges = _polytope_edges(piece)
+    start, end = distance[edges[:, 0]], distance[edges[:, 1]]
+    crossing = (start < 0.0) != (end < 0.0)
+    a, b = edges[crossing, 0], edges[crossing, 1]
+    fraction = (distance[a] / (distance[a] - distance[b]))[:, None]
+    points = np.vstack((vertices[distance <= 0.0], vertices[a] + (vertices[b] - vertices[a]) * fraction))
+    rebuilt = _polytope_piece(points, piece.depth) if len(points) >= 4 else None
+    return rebuilt if rebuilt is not None else empty
+
+
+def _vertex_surface_gap(first, second):
+    """Smallest distance from a corner of either polytope to the other one.
+
+    SINTEZ AGR Checker measures the gap exactly this way - from each vertex
+    to the nearest point of the other hull - so this is what has to clear
+    the gap setting.
+    """
+    gaps = []
+    for points, other in ((first.vertices, second), (second.vertices, first)):
+        triangles = other.faces
+        gaps.append(float(hull64.distance_to_triangles(
+            points,
+            other.vertices[triangles[:, 0]],
+            other.vertices[triangles[:, 1]],
+            other.vertices[triangles[:, 2]],
+        ).min()))
+    return min(gaps)
+
+
+def _overlapping(first, second):
+    """True when two convex polytopes share interior (separating axis test)."""
+    axes = [_polytope_planes(first)[0], _polytope_planes(second)[0]]
+    edges_first = _polytope_edges(first)
+    edges_second = _polytope_edges(second)
+    if len(edges_first) and len(edges_second):
+        u = first.vertices[edges_first[:, 1]] - first.vertices[edges_first[:, 0]]
+        v = second.vertices[edges_second[:, 1]] - second.vertices[edges_second[:, 0]]
+        crosses = np.cross(u[:, None, :], v[None, :, :]).reshape((-1, 3))
+        lengths = np.linalg.norm(crosses, axis=1)
+        keep = lengths > 1.0e-12
+        axes.append(crosses[keep] / lengths[keep, None])
+    axes = np.vstack([block for block in axes if len(block)])
+    first_projection = first.vertices @ axes.T
+    second_projection = second.vertices @ axes.T
+    separation = np.maximum(
+        second_projection.min(axis=0) - first_projection.max(axis=0),
+        first_projection.min(axis=0) - second_projection.max(axis=0),
+    )
+    return bool(separation.max() <= 0.0)
+
+
+def _separate_polytopes(pieces, gap):
+    """Make every pair of polytopes clear ``gap`` the way the checker measures.
+
+    The exact inset already guarantees the gap between pieces that did not
+    overlap before it; pieces that did are resolved here. The smaller piece
+    of such a pair is clipped by a plane ``gap`` away from the larger one,
+    along the axis that needs the thinnest slice. Clipping only ever shrinks
+    a piece, so resolving one pair cannot break another, and one pass over
+    the pairs is enough.
+    """
+    pieces = list(pieces)
+    lower = [piece.vertices.min(axis=0) for piece in pieces]
+    upper = [piece.vertices.max(axis=0) for piece in pieces]
+    for index in range(len(pieces)):
+        for other in range(index + 1, len(pieces)):
+            first, second = pieces[index], pieces[other]
+            if len(first.faces) == 0 or len(second.faces) == 0:
+                continue
+            if np.any(upper[index] + gap < lower[other]) or np.any(upper[other] + gap < lower[index]):
+                continue
+            if not _overlapping(first, second) and _vertex_surface_gap(first, second) >= gap:
+                continue
+            small, large = (index, other) if abs(first.volume) <= abs(second.volume) else (other, index)
+            clipped = pieces[small]
+            fixed = pieces[large]
+            direction = fixed.vertices.mean(axis=0) - clipped.vertices.mean(axis=0)
+            axes = [_polytope_planes(clipped)[0], _polytope_planes(fixed)[0]]
+            if float(np.linalg.norm(direction)) > 0.0:
+                axes.append((direction / np.linalg.norm(direction))[None, :])
+            axes = np.vstack([block for block in axes if len(block)])
+            # Orient every axis from the clipped piece towards the fixed one.
+            axes = axes * np.where(axes @ direction < 0.0, -1.0, 1.0)[:, None]
+            limit = (fixed.vertices @ axes.T).min(axis=0) - gap
+            slice_depth = (clipped.vertices @ axes.T).max(axis=0) - limit
+            best = int(np.argmin(slice_depth))
+            pieces[small] = _clip_polytope(clipped, axes[best], float(limit[best]))
+            if len(pieces[small].faces):
+                lower[small] = pieces[small].vertices.min(axis=0)
+                upper[small] = pieces[small].vertices.max(axis=0)
+    return pieces
+
+
+def _inset_convex_piece(piece, distance):
+    """Move every support plane of a convex piece inward by one distance.
+
+    Planes come from area-weighted groups of coplanar hull triangles, so a
+    sliver triangle cannot contribute a wrong direction. Every vertex takes a
+    damped least-squares step against its incident planes and is then
+    projected behind all shifted planes, which guarantees the inset hull lies
+    inside the original by at least the requested distance.
+    """
+    empty = Piece(
+        vertices=np.empty((0, 3), dtype=np.float64),
+        faces=np.empty((0, 3), dtype=np.int32),
+        depth=piece.depth,
+    )
+    if distance <= 0.0:
+        return piece
+    hull = _convex_hull(piece.vertices, simplify=False)
+    if hull is None:
+        return empty
+    vertices, faces = hull
+    planes, incident = _reliable_hull_planes(vertices, faces)
+    if len(planes) < 4:
+        return empty
+    plane_normals = np.asarray([normal for normal, _offset in planes])
+    plane_offsets = np.asarray([offset for _normal, offset in planes]) - distance
+    moved = vertices.copy()
+    for index, members in enumerate(incident):
+        if not members:
+            continue
+        matrix = plane_normals[members]
+        system = matrix.T @ matrix + np.eye(3) * 1.0e-6
+        step = np.linalg.solve(system, matrix.T @ np.full(len(members), -distance))
+        step_length = float(np.linalg.norm(step))
+        if step_length > distance * 20.0:
+            step *= distance * 20.0 / step_length
+        moved[index] = vertices[index] + step
+    for _pass in range(16):
+        worst = 0.0
+        for normal, offset in zip(plane_normals, plane_offsets):
+            excess = moved @ normal - offset
+            outside = excess > 0.0
+            if outside.any():
+                moved[outside] -= np.outer(excess[outside], normal)
+                worst = max(worst, float(excess[outside].max()))
+        if worst <= 1.0e-9:
+            break
+    # Alternating projections converge slowly between nearly parallel planes.
+    # Pull any remaining vertex towards the centre until it is inside.
+    center = vertices.mean(axis=0)
+    center_margin = plane_offsets - plane_normals @ center
+    if np.any(center_margin <= 0.0):
+        return empty
+    excess = moved @ plane_normals.T - plane_offsets
+    for index in np.flatnonzero((excess > 0.0).any(axis=1)):
+        direction = moved[index] - center
+        along = plane_normals @ direction
+        limits = np.where(along > 1.0e-15, center_margin / np.maximum(along, 1.0e-15), np.inf)
+        moved[index] = center + direction * min(1.0, float(limits.min()) * (1.0 - 1.0e-9))
+    inset = _hull_piece(moved, depth=piece.depth)
+    return inset if inset is not None else empty
+
+
+# --------------------------------------------------------------------------
+# Safety invariants against the source
+# --------------------------------------------------------------------------
+
+_RAY_DIRECTIONS = (
+    Vector((0.5773, 0.5774, 0.5775)).normalized(),
+    Vector((-0.3119, 0.7207, -0.6193)).normalized(),
+    Vector((0.8329, -0.4105, 0.3710)).normalized(),
+)
+
+
+def _inside_source(bvh, point):
+    """Signed ray-crossing count; robust for overlapping closed shells."""
+    votes = 0
+    for direction in _RAY_DIRECTIONS:
+        origin = Vector(tuple(point))
+        winding = 0
+        for _guard in range(256):
+            hit = bvh.ray_cast(origin, direction)
+            if hit[0] is None:
+                break
+            winding += 1 if hit[1].dot(direction) > 0.0 else -1
+            # BVH coordinates are float32: step clearly past every hit.
+            origin = hit[0] + direction * 1.0e-3
+        votes += 1 if winding > 0 else 0
+    return votes >= 2
+
+
+def _winding_numbers(vertices, faces, points, chunk=256):
+    """Generalized winding number of points with respect to a closed mesh."""
+    a = vertices[faces[:, 0]]
+    b = vertices[faces[:, 1]]
+    c = vertices[faces[:, 2]]
+    result = np.zeros(len(points))
+    for start in range(0, len(points), chunk):
+        query = points[start:start + chunk][:, None, :]
+        x = a[None] - query
+        y = b[None] - query
+        z = c[None] - query
+        lx = np.sqrt((x * x).sum(axis=2))
+        ly = np.sqrt((y * y).sum(axis=2))
+        lz = np.sqrt((z * z).sum(axis=2))
+        determinant = (x * np.cross(y, z)).sum(axis=2)
+        denominator = (
+            lx * ly * lz
+            + (x * y).sum(axis=2) * lz
+            + (y * z).sum(axis=2) * lx
+            + (z * x).sum(axis=2) * ly
+        )
+        result[start:start + chunk] = (
+            np.arctan2(determinant, denominator).sum(axis=1) / (2.0 * math.pi)
+        )
+    return result
+
+
+def _source_excess(source_vertices, source_faces, pieces, probe=5.0e-3, tolerance=0.0):
+    """Return hulls whose facets lie outside the source volume.
+
+    Facet samples are moved inward along the facet normal by more than the
+    convexity tolerance, so a facet on the source surface counts as inside
+    while a hull bridging a door, niche or arch has samples in empty space.
+    """
+    origin = source_vertices.mean(axis=0)
+    bvh = _surface_bvh(source_vertices - origin, source_faces)
+    offending = []
+    weights = [
+        (a, b)
+        for a in range(4)
+        for b in range(4 - a)
+    ]
+    for index, piece in enumerate(pieces):
+        vertices = piece.vertices
+        faces = piece.faces
+        normals, areas = _face_normals(vertices, faces)
+        corners = vertices[faces]
+        longest = np.max(
+            np.stack((
+                np.linalg.norm(corners[:, 1] - corners[:, 0], axis=1),
+                np.linalg.norm(corners[:, 2] - corners[:, 1], axis=1),
+                np.linalg.norm(corners[:, 0] - corners[:, 2], axis=1),
+            )),
+            axis=0,
+        )
+        reliable = 2.0 * areas / np.maximum(longest, 1.0e-12) >= MIN_FACET_SIZE
+        if not reliable.any():
+            continue
+        planes = _convex_planes(piece)
+        plane_normals = np.asarray([normal for _point, normal in planes]).reshape((-1, 3))
+        plane_offsets = np.asarray([float(normal @ point) for point, normal in planes])
+        samples = np.vstack([
+            corners[reliable, 0] * (1.0 - (a + b) / 3.0)
+            + corners[reliable, 1] * (a / 3.0)
+            + corners[reliable, 2] * (b / 3.0)
+            - normals[reliable] * probe
+            for a, b in weights
+        ])
+        if len(plane_normals):
+            samples = samples[
+                np.all(samples @ plane_normals.T - plane_offsets <= 1.0e-6, axis=1)
+            ]
+        outside = 0
+        for point in samples - origin:
+            if _inside_source(bvh, point):
+                continue
+            hit = bvh.find_nearest(Vector(tuple(point)))
+            if hit[0] is None or float(hit[3]) > tolerance:
+                outside += 1
+        if outside:
+            offending.append((index, outside))
+    return offending
 
 
 def _source_coverage_deviation(
@@ -1554,274 +2560,424 @@ def _source_coverage_deviation(
     tolerance=0.0,
     sample_limit=25000,
 ):
-    """Measure source-surface samples against convex output half-spaces."""
+    """Measure source-surface samples against convex output colliders."""
     if not convex_pieces:
         return math.inf, 0
-
     centroids = source_vertices[source_faces].mean(axis=1)
     samples = np.vstack((source_vertices, centroids))
     if len(samples) > sample_limit:
-        indices = np.linspace(
-            0,
-            len(samples) - 1,
-            sample_limit,
-            dtype=np.int32,
-        )
+        indices = np.linspace(0, len(samples) - 1, sample_limit, dtype=np.int32)
         samples = samples[indices]
 
-    piece_planes = []
+    all_vertices = []
+    all_faces = []
+    offset = 0
     for piece in convex_pieces:
-        planes = _convex_planes(piece)
-        if not planes:
-            continue
-        plane_points = np.asarray(
-            [plane_point for plane_point, _ in planes],
-            dtype=np.float64,
-        )
-        plane_normals = np.asarray(
-            [plane_normal for _, plane_normal in planes],
-            dtype=np.float64,
-        )
-        piece_planes.append((plane_points, plane_normals))
+        all_vertices.append(piece.vertices)
+        all_faces.append(piece.faces + offset)
+        offset += len(piece.vertices)
+    bvh = _surface_bvh(np.vstack(all_vertices), np.vstack(all_faces))
+    bounds = np.asarray(
+        [np.r_[piece.vertices.min(axis=0), piece.vertices.max(axis=0)] for piece in convex_pieces]
+    )
+    planes = [None] * len(convex_pieces)
 
     worst = 0.0
     uncovered = 0
+    tolerance = float(tolerance)
     for point in samples:
-        nearest_violation = math.inf
-        for plane_points, plane_normals in piece_planes:
-            violation = float(
-                np.max(
-                    np.einsum(
-                        "ij,ij->i",
-                        point - plane_points,
-                        plane_normals,
-                    )
-                )
-            )
-            nearest_violation = min(nearest_violation, violation)
-            if nearest_violation <= 0.0:
+        hit = bvh.find_nearest(Vector(tuple(point)))
+        nearest = float(hit[3]) if hit[0] is not None else math.inf
+        if nearest <= tolerance:
+            worst = max(worst, nearest)
+            continue
+        inside = False
+        candidates = np.flatnonzero(
+            np.all(point >= bounds[:, :3] - 1.0e-6, axis=1)
+            & np.all(point <= bounds[:, 3:] + 1.0e-6, axis=1)
+        )
+        for index in candidates:
+            if planes[index] is None:
+                planes[index] = _convex_planes(convex_pieces[index])
+            if _point_inside_convex(point, planes[index], epsilon=1.0e-6):
+                inside = True
                 break
-        if nearest_violation > tolerance:
-            uncovered += 1
-        if nearest_violation > 0.0:
-            worst = max(worst, nearest_violation)
+        if inside:
+            continue
+        uncovered += 1
+        worst = max(worst, nearest)
     return worst, uncovered
 
 
-def _run_attempt(source, settings, seed):
-    rng = random.Random(seed)
-    leaves = _component_pieces(
-        source.vertices,
-        source.faces,
-    )
-    topology_aware_leaves = []
-    for piece in leaves:
-        sweep = _ring_sweep_decomposition(
-            piece,
-            settings.tolerance,
-            settings.gap,
-        )
-        if sweep is None:
-            topology_aware_leaves.append(piece)
-        else:
-            topology_aware_leaves.extend(sweep)
-    leaves = topology_aware_leaves
-    leaves = [
-        _normalize_gap_scale_concavity(piece, settings.gap)
-        for piece in leaves
-    ]
-    warnings = []
-    maximum_open_deviation = 0.0
-    maximum_approximation_deviation = max(
-        (
-            piece.approximation_deviation
-            for piece in leaves
-        ),
-        default=0.0,
-    )
+# --------------------------------------------------------------------------
+# Driver
+# --------------------------------------------------------------------------
 
-    for index, piece in enumerate(list(leaves)):
-        if piece.closed:
-            continue
-        closed, deviation = _close_small_open_piece(piece, settings.tolerance)
-        maximum_open_deviation = max(maximum_open_deviation, deviation)
-        if closed is None:
-            piece.unsplittable = True
-            warnings.append(
-                "Open component {} cannot be closed within the {:.3f} m tolerance".format(
-                    index + 1,
-                    settings.tolerance,
-                )
-            )
-        else:
-            leaves[index] = closed
-            warnings.append(
-                "Open component {} was conservatively closed ({:.3f} m deviation)".format(
-                    index + 1,
-                    deviation,
-                )
-            )
+def _location(piece):
+    center = piece.vertices.mean(axis=0) if len(piece.vertices) else np.zeros(3)
+    return "({:.2f}, {:.2f}, {:.2f})".format(*center)
 
-    while len(leaves) < settings.max_parts:
-        pending = [
-            piece
-            for piece in leaves
-            if piece.closed
-            and not piece.convex
-            and not piece.unsplittable
-            and piece.depth < settings.max_depth
-        ]
-        if not pending:
+
+def _thin_limit(settings):
+    return float(getattr(settings, "thin_threshold", THIN_PART_DEFAULT))
+
+
+def _run_attempt(source, settings, seed=0):
+    global _feature_tolerance
+    thin_limit = _thin_limit(settings)
+    tolerance = max(REFLEX_EPSILON, thin_limit * FEATURE_TOLERANCE_RATIO)
+    saved = _feature_tolerance
+    # The convexity tests of this run accept steps up to the tolerance.
+    _feature_tolerance = tolerance
+    try:
+        return _decompose_with_tolerance(source, settings, seed, thin_limit, tolerance)
+    finally:
+        _feature_tolerance = saved
+
+
+@dataclass(eq=False)
+class _Node:
+    """One cut of the decomposition tree, or one finished part."""
+    piece: Piece
+    children: list = field(default_factory=list)
+    leaves: list = field(default_factory=list)
+    thin: list = field(default_factory=list)
+    invalid: list = field(default_factory=list)
+    skip: int = 0
+    exhausted: bool = False
+    parent: object = None
+    cut_key: object = None
+
+    @property
+    def count(self):
+        return len(self.leaves) + sum(child.count for child in self.children)
+
+    @property
+    def work(self):
+        """Triangles that re-cutting this subtree has to process again.
+
+        A deterministic stand-in for the time a variant costs: every internal
+        node analyses and cuts its piece, and that effort grows with the
+        piece's triangles. Wall time would order the search differently on a
+        faster machine, and the same model must cut the same way everywhere.
+        """
+        if not self.children:
+            return 0
+        return len(self.piece.faces) + sum(child.work for child in self.children)
+
+    @property
+    def thin_count(self):
+        return len(self.thin) + sum(child.thin_count for child in self.children)
+
+    @property
+    def score(self):
+        """Fewer parts first, then fewer parts thinner than the threshold."""
+        return (self.count, self.thin_count)
+
+    def collect(self):
+        if not self.children:
+            return list(self.leaves), list(self.thin), list(self.invalid)
+        leaves, thin, invalid = list(self.leaves), list(self.thin), list(self.invalid)
+        for child in self.children:
+            child_leaves, child_thin, child_invalid = child.collect()
+            leaves += child_leaves
+            thin += child_thin
+            invalid += child_invalid
+        return leaves, thin, invalid
+
+    def internal_nodes(self):
+        nodes = [self] if self.children else []
+        for child in self.children:
+            nodes += child.internal_nodes()
+        return nodes
+
+
+def _decompose_node(piece, thin_limit, budget, skip=0):
+    """Decompose one piece into a subtree of convex parts."""
+    node = _Node(piece=piece, skip=skip)
+    if piece.convex:
+        # Replace the cut mesh by its clean hull: cut lines leave long
+        # sliver triangles that carry no geometry of their own.
+        hull = _hull_piece(piece.vertices, depth=piece.depth)
+        node.leaves.append(hull if hull is not None and hull.closed else piece)
+        return node
+    if _hull_width(piece) < thin_limit:
+        # Thinner than the thin-part threshold. Cutting it further would only
+        # breed slivers, and deleting it would lose shape, so it enters the
+        # merge pool as a hull for a neighbour to absorb.
+        hull = _hull_piece(piece.vertices, depth=piece.depth)
+        thin = hull if hull is not None and hull.closed else piece
+        node.leaves.append(thin)
+        node.thin.append(thin)
+        return node
+    if budget[0] <= 0:
+        node.invalid.append(piece)
+        return node
+    key, children = _split_piece_keyed(piece, thin_limit, skip=skip)
+    if children is None:
+        node.invalid.append(piece)
+        return node
+    return _grow_node(node, key, children, thin_limit, budget)
+
+
+def _grow_node(node, key, children, thin_limit, budget):
+    """Attach the subtrees of an already chosen cut to its node."""
+    node.cut_key = key
+    budget[0] -= 1
+    for child in children:
+        child_node = _decompose_node(child, thin_limit, budget)
+        child_node.parent = node
+        node.children.append(child_node)
+    return node
+
+
+def _search_priority(node):
+    """Parts per triangle of the node's own piece.
+
+    Ordering by parts per unit of whole-subtree work was measured as well and
+    is worse: it harvests the deep nodes first, after which the middle of the
+    tree has little left to give, and the tower still ended at 248 parts after
+    running the search to exhaustion.
+    """
+    return node.count / max(len(node.piece.faces), 1)
+
+
+def _refine_tree(roots, thin_limit, passes):
+    """Re-cut the parts that produced the most pieces and keep improvements.
+
+    Every cut of the tree is exact, so any node can be cut again along a
+    later ranked plane. A variant replaces the old subtree only when it ends
+    in fewer parts, so the search can only improve the result.
+
+    The node to re-cut is the one with the most parts per triangle. It is
+    not retired after a few tries: it keeps walking down its ranked planes
+    until they run out, and a node that has improved once is free to improve
+    again. On the reference tower 297 variants now end at 259 parts in about
+    six and a half minutes; retiring nodes after three tries stopped at 267
+    after eleven.
+
+    Moving the window by one plane often leaves the best cut in it unchanged,
+    and such a variant would rebuild a subtree that has already been judged.
+    Those are recognised by the name of their top cut and skipped without
+    being counted as a variant.
+    """
+    improved = 0
+    attempts = 0
+    while attempts < passes:
+        work_limit = SEARCH_WORK_SHARE * sum(root.work for root in roots)
+        candidates = []
+        for root in roots:
+            candidates += [
+                node for node in root.internal_nodes()
+                if not node.exhausted and node.count > 2
+            ]
+        if not candidates:
             break
-        piece = max(
-            pending,
-            key=lambda item: (item.concave_edges, item.volume),
-        )
-        approximated, deviation = _approximate_convex_piece(
-            piece,
-            settings.tolerance,
-        )
-        if approximated is not None:
-            leaves.remove(piece)
-            leaves.append(approximated)
-            maximum_approximation_deviation = max(
-                maximum_approximation_deviation,
-                deviation,
-            )
+        node = max(candidates, key=_search_priority)
+        tried = node.__dict__.setdefault("tried", {node.cut_key})
+        skip = node.__dict__.get("next_skip", node.skip) + 1
+        node.next_skip = skip
+        if skip > SEARCH_MAX_SKIP:
+            node.exhausted = True
             continue
-
-        split = _best_exact_split(
-            piece,
-            settings.gap,
-            settings.tolerance,
-            rng,
-        )
-        if split is None:
-            piece.unsplittable = True
+        key, children = _split_piece_keyed(node.piece, thin_limit, skip=skip)
+        if children is None:
+            node.exhausted = True
             continue
-        leaves.remove(piece)
-        leaves.extend(split)
+        if key in tried:
+            continue
+        if node.work > work_limit and len(tried) > SEARCH_HEAVY_VARIANTS:
+            # A node holding a large share of the model is close to a restart
+            # of the whole decomposition. It gets one real variant: excluding
+            # such nodes entirely cost the tower 247 -> 266 parts, because a
+            # single accepted re-cut near the root reshapes everything below,
+            # but its further variants took 353 s and gave nothing back.
+            node.exhausted = True
+            continue
+        tried.add(key)
+        attempts += 1
+        budget = [LEAF_LIMIT]
+        variant = _grow_node(
+            _Node(piece=node.piece, skip=skip), key, children, thin_limit, budget
+        )
+        if variant.invalid or variant.score >= node.score:
+            continue
+        improved += node.count - variant.count
+        variant.parent = node.parent
+        variant.tried = tried
+        variant.next_skip = skip
+        if node.parent is None:
+            roots[roots.index(node)] = variant
+        else:
+            node.parent.children[node.parent.children.index(node)] = variant
+    return roots, improved, attempts
 
-    invalid = [piece for piece in leaves if not piece.convex]
-    complete = not invalid
-    if invalid:
+
+def _decompose_with_tolerance(source, settings, seed, thin_limit, tolerance):
+    gap = float(settings.gap)
+    warnings = []
+    components = _component_pieces(source.vertices, source.faces)
+
+    invalid = []
+    pending = []
+    for piece in components:
+        if piece.closed:
+            pending.append(piece)
+            continue
+        topology = _topology(len(piece.vertices), piece.faces)
+        invalid.append(piece)
         warnings.append(
-            "{} component(s) remain open or concave; increase Max Parts/Search Depth "
-            "or repair the source".format(len(invalid))
+            "Source component near {} is not a closed solid ({} open, {} "
+            "non-manifold edges); fix the model".format(
+                _location(piece),
+                topology.boundary_edges,
+                topology.nonmanifold_edges,
+            )
         )
 
-    convex_pieces = [piece for piece in leaves if piece.convex]
-    if complete:
-        convex_pieces, overlap_complete = _resolve_component_overlaps(
-            convex_pieces,
-            settings,
+    source_origin = source.vertices.mean(axis=0)
+    source_bvh = _surface_bvh(source.vertices - source_origin, source.faces)
+    budget = [LEAF_LIMIT]
+    roots = [_decompose_node(piece, thin_limit, budget) for piece in pending]
+    passes = max(0, int(getattr(settings, "attempts", 1)) - 1) * REFINEMENT_TRIES
+    if passes:
+        roots, improved, attempts = _refine_tree(roots, thin_limit, passes)
+        if improved:
+            warnings.append(
+                "Search removed {} part(s) in {} variant(s)".format(improved, attempts)
+            )
+    convex = []
+    for root in roots:
+        root_leaves, _root_thin, root_invalid = root.collect()
+        convex += root_leaves
+        invalid += root_invalid
+    for piece in invalid:
+        warnings.append(
+            "Concave part near {} ({:.3f} m3) could not be cut".format(
+                _location(piece), piece.volume
+            )
         )
+    if budget[0] <= 0:
+        warnings.append(
+            "Decomposition needs more than {} parts".format(LEAF_LIMIT)
+        )
+
+    complete = not invalid
+    if not complete:
+        warnings.append(
+            "{} part(s) could not be decomposed; see the messages above".format(
+                len(invalid)
+            )
+        )
+
+    convex = _merge_within_tolerance(
+        convex, source_bvh, source_origin, tolerance, thin_limit
+    )
+    kept = _absorb_thin_pieces(
+        convex, thin_limit, tolerance, source_bvh, source_origin
+    )
+    # Nothing is dropped: parts thinner than the threshold that no neighbour
+    # could absorb stay in the collision and are only reported.
+    thin_pieces = [
+        piece for piece in kept if _minimum_width(piece) < thin_limit
+    ]
+    thin_volume = sum(piece.volume for piece in thin_pieces)
+    thin_width = max((_minimum_width(piece) for piece in thin_pieces), default=0.0)
+    if thin_pieces:
+        warnings.append(
+            "{} part(s) stayed thinner than {:.3f} m ({:.3f} m3)".format(
+                len(thin_pieces), thin_limit, thin_volume
+            )
+        )
+
+    if len(components) > 1:
+        kept, overlap_complete = _resolve_component_overlaps(kept)
         if not overlap_complete:
             complete = False
-            warnings.append(
-                "Overlap trimming exceeded Max Parts; raise the limit or simplify the source"
-            )
-        else:
-            convex_pieces = _merge_convex_neighbours(
-                convex_pieces,
-                settings,
-            )
-            # A successful merge can expose a positive-volume intersection
-            # that did not exist between either original child and a third
-            # piece. Run one final subtraction pass and do not merge again.
-            convex_pieces, final_overlap_complete = (
-                _resolve_component_overlaps(
-                    convex_pieces,
-                    settings,
-                )
-            )
-            if not final_overlap_complete:
-                complete = False
-                warnings.append(
-                    "Final overlap trimming exceeded Max Parts"
-                )
-            convex_pieces = [
-                _inset_convex_piece(
-                    piece,
-                    settings.gap * 0.5 + 1.0e-7,
-                )
-                for piece in convex_pieces
-            ]
-            convex_pieces = [
-                piece for piece in convex_pieces
-                if not _is_ignorable_fragment(piece, settings)
-            ]
-            # Blender stores generated mesh coordinates as float32. Resolve
-            # once more after the final inset so conversion-level contacts
-            # cannot turn into a small positive-volume penetration.
-            convex_pieces, inset_overlap_complete = (
-                _resolve_component_overlaps(
-                    convex_pieces,
-                    settings,
-                )
-            )
-            convex_pieces = [
-                piece for piece in convex_pieces
-                if not _is_ignorable_fragment(piece, settings)
-            ]
-            if not inset_overlap_complete:
-                complete = False
-                warnings.append(
-                    "Post-gap overlap trimming exceeded Max Parts"
-                )
-            coverage_deviation, uncovered_samples = (
-                _source_coverage_deviation(
-                    source.vertices,
-                    source.faces,
-                    convex_pieces,
-                    tolerance=settings.tolerance,
-                )
-            )
-            if coverage_deviation > settings.tolerance:
-                warnings.append(
-                    "{} proxy surface sample(s) exceed tolerance by up to "
-                    "{:.3f} m; these may be internal overlapping layers".format(
-                        uncovered_samples,
-                        coverage_deviation,
-                    )
-                )
-                # Coverage is a safety invariant, not a quality score.  A
-                # small detached architectural component must not disappear
-                # merely because it contributes less than a percentage of a
-                # large proxy.  Two samples are tolerated for numerical edge
-                # cases; anything more outside the user tolerance rejects the
-                # whole candidate and leaves the previous UCX set untouched.
-                severe_coverage_loss = uncovered_samples > 2
-                if severe_coverage_loss:
-                    complete = False
+            warnings.append("Overlap trimming exceeded the part limit")
+        kept = _merge_convex_neighbours(kept)
 
-    hulls = [(piece.vertices, piece.faces) for piece in convex_pieces]
+    kept = _separate_touching_pieces(kept, limit=tolerance)
+
+    if complete and len(components) == 1:
+        # Bridged shallow steps add at most a tolerance-thick film.
+        partition_volume = sum(piece.volume for piece in kept) + thin_volume
+        expected = components[0].volume
+        source_area = float(_face_normals(components[0].vertices, components[0].faces)[1].sum())
+        if abs(partition_volume - expected) > tolerance * source_area + 1.0e-6:
+            complete = False
+            warnings.append(
+                "Collision volume {:.4f} m3 differs from source {:.4f} m3".format(
+                    partition_volume, expected
+                )
+            )
+
+    # Exact polytopes before the gap: the float32 hulls the cutting stages
+    # build are convex only to a fraction of a millimetre, and shifting their
+    # planes would carry that error into the gap.
+    kept = [
+        _polytope_piece(piece.vertices, piece.depth) or piece for piece in kept
+    ]
+    hulls_before_gap = kept
+    kept = [_inset_polytope(piece, gap * 0.5 + 1.0e-7) for piece in kept]
+    kept = [
+        piece for piece in kept
+        if len(piece.faces) and not _is_ignorable_fragment(piece, settings)
+    ]
+    # Pieces that overlapped before the inset still overlap or sit closer
+    # than the gap; clip them apart exactly, the way SINTEZ AGR Checker
+    # measures intersections and gaps.
+    kept = _separate_polytopes(kept, gap)
+    kept = [
+        piece for piece in kept
+        if len(piece.faces) and not _is_ignorable_fragment(piece, settings)
+    ]
+
+    if complete and hulls_before_gap:
+        excess = _source_excess(
+            source.vertices,
+            source.faces,
+            hulls_before_gap,
+            probe=thin_limit + 5.0e-3,
+            tolerance=thin_limit,
+        )
+        if excess:
+            complete = False
+            warnings.append(
+                "{} hull(s) extend outside the source volume".format(len(excess))
+            )
+
+    if len(kept) > MAX_PARTS:
+        complete = False
+        warnings.append(
+            "Collision needs {} hulls, above the limit of {}".format(
+                len(kept), MAX_PARTS
+            )
+        )
+
+    # The output is rebuilt as exact polytopes triangulated facet by facet:
+    # separating touching pieces cuts them again, and needle triangles are
+    # exactly what makes SINTEZ AGR Checker report a convex hull as
+    # concave.
+    output = []
+    for piece in kept:
+        polytope = _polytope_piece(piece.vertices, piece.depth, simplify=True)
+        if polytope is not None:
+            output.append(polytope)
+    hulls = [(piece.vertices, piece.faces) for piece in output]
     return DecompositionResult(
         hulls=hulls,
-        max_deviation=max(
-            maximum_open_deviation,
-            maximum_approximation_deviation,
-        ),
+        max_deviation=tolerance,
         total_triangles=sum(len(faces) for _, faces in hulls),
         seed=seed,
         warnings=warnings,
         complete=complete,
         remaining_invalid=len(invalid),
+        ignored_parts=[(piece.vertices, piece.faces) for piece in thin_pieces],
+        failed_parts=[(piece.vertices, piece.faces) for piece in invalid],
+        feature_tolerance=tolerance,
     )
 
 
 def decompose(source, settings):
-    attempts = [
-        _run_attempt(source, settings, settings.seed + attempt_index)
-        for attempt_index in range(settings.attempts)
-    ]
-
-    def score(result):
-        return (
-            0 if result.complete else 1,
-            result.remaining_invalid,
-            len(result.hulls),
-            result.total_triangles,
-        )
-
-    return min(attempts, key=score)
+    return _run_attempt(source, settings, 0)

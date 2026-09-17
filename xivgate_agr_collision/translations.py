@@ -12,7 +12,6 @@ _RU_DEFAULT = {
     "Last Result": "Последний результат",
     "Advanced Collision Settings": "Расширенные настройки коллизии",
     "Geometry Preprocessing": "Предварительная обработка геометрии",
-    "Convex Search Limits": "Ограничения поиска выпуклых частей",
     "Viewport Output": "Отображение результата",
     "Manual Cleanup": "Ручная очистка",
     "Topology-changing preprocess is enabled": (
@@ -37,26 +36,13 @@ _RU_DEFAULT = {
     ),
     "Source": "Источник",
     "No active mesh": "Нет активного меш-объекта",
-    "Accuracy": "Точность",
-    "Exact Geometry Repair": "Точное восстановление геометрии",
-    "Exact Split Limits": "Ограничения точного разбиения",
-    "Output": "Результат",
     "Status": "Статус",
     "Ready": "Готово",
     "Source: {}": "Источник: {}",
     "Input / working: {:,} / {:,} tris": "Исходных / рабочих: {:,} / {:,} трис",
     "UCX: {} objects, {:,} tris": "UCX: {} объектов, {:,} трис",
     "Max deviation: {:.3f} m": "Макс. отклонение: {:.3f} м",
-    "Tolerance": "Допуск",
-    "Maximum allowed collision deviation; 0.10 m is the strict universal AGR limit": (
-        "Максимально допустимое отклонение коллизии; 0,10 м — строгий "
-        "универсальный лимит AGR"
-    ),
     "Min Feature": "Мин. размер детали",
-    "Separate details smaller than this size may be removed during preprocessing": (
-        "Отдельные детали меньше этого размера могут быть удалены "
-        "при предварительной обработке"
-    ),
     (
         "When topology-changing preprocessing is explicitly enabled, "
         "separate details smaller than this size may be removed"
@@ -86,30 +72,31 @@ _RU_DEFAULT = {
         "крупнейший компонент никогда не удаляется"
     ),
     "Thin Threshold": "Порог толщины",
-    "Maximum thickness of separate components that may be ignored": (
-        "Максимальная толщина отдельных компонентов, которые можно игнорировать"
+    "Parts of the model thinner than this receive no collision": (
+        "Части модели тоньше этого значения не получают коллизию"
     ),
     "Gap": "Зазор",
-    "Air gap between neighbouring hulls; 0.0002 m is the AGR minimum": (
-        "Воздушный зазор между соседними выпуклыми оболочками; 0,0002 м — минимум AGR"
+    (
+        "Air gap between neighbouring hulls; AGR recommends 0.2-10 mm, and "
+        "1 mm clears SINTEZ AGR Checker at any gap tolerance it allows"
+    ): (
+        "Воздушный зазор между соседними оболочками; AGR рекомендует 0,2–10 мм, "
+        "а 1 мм проходит проверку SINTEZ AGR Checker при любом допустимом в нём "
+        "допуске зазора"
     ),
     "Optimization Passes": "Проходы оптимизации",
     (
-        "Try deterministic tie variants and keep the smallest complete result; "
-        "each pass runs the full search"
+        "Re-cut the parts that produced the most pieces and keep "
+        "variants with fewer pieces; every variant stays exact, so more "
+        "passes only trade generation time for a simpler collision. "
+        "1 is a single fast pass; around 100 gives the smallest sets on "
+        "complex buildings in a few minutes"
     ): (
-        "Проверяет детерминированные варианты с равной оценкой и сохраняет "
-        "наименьший полный результат; каждый проход выполняет полный поиск"
-    ),
-    "Seed": "Начальное значение",
-    "Base seed for deterministic split tie variants": (
-        "Базовый сид для детерминированных вариантов разбиения с равной оценкой"
-    ),
-    "Max Parts": "Макс. частей",
-    "Hard maximum number of UCX hulls": "Жёсткий максимум количества UCX-оболочек",
-    "Search Depth": "Глубина поиска",
-    "Maximum number of recursive separating planes": (
-        "Максимальное количество рекурсивных разделяющих плоскостей"
+        "Перерезает части, давшие больше всего кусков, и оставляет варианты "
+        "с меньшим их числом; каждый вариант остаётся точным, поэтому "
+        "дополнительные проходы меняют только время генерации. 1 — один "
+        "быстрый проход; около 100 даёт самые экономные наборы на сложных "
+        "зданиях за несколько минут"
     ),
     "Wire Display": "Каркасное отображение",
     "Display generated colliders as wireframe objects": (
@@ -167,6 +154,89 @@ _RU_DEFAULT = {
     "Validation passed": "Проверка пройдена",
     "Validation failed": "Проверка не пройдена",
     "Removed {} collider(s)": "Удалено коллайдеров: {}",
+    "Collision Debugger": "Отладчик коллизии",
+    "Check Collection": "Проверяемая коллекция",
+    (
+        "Collection the collision debugger checks; the last generated "
+        "collision set is filled in automatically"
+    ): (
+        "Коллекция, которую проверяет отладчик; последний созданный набор "
+        "коллизии подставляется автоматически"
+    ),
+    "UCX Objects Only": "Только UCX-объекты",
+    "Check only UCX collision objects and skip other meshes in the collection": (
+        "Проверять только UCX-объекты коллизии и пропускать остальные меши коллекции"
+    ),
+    "Concavity": "Вогнутость",
+    "Concavity Tolerance": "Допуск вогнутости",
+    (
+        "Select objects whose surface sinks deeper than this below their "
+        "own convex hull; 0 finds every concavity above float32 rounding"
+    ): (
+        "Выделяет объекты, поверхность которых уходит под собственную "
+        "выпуклую оболочку глубже этого значения; 0 находит любую вогнутость "
+        "крупнее округления float32"
+    ),
+    "Small Parts": "Мелкие части",
+    "Volume Below": "Объём меньше",
+    "Select objects whose enclosed volume is smaller than this": (
+        "Выделяет объекты, замкнутый объём которых меньше этого значения"
+    ),
+    "Thin Parts": "Тонкие части",
+    "Thickness Below": "Толщина меньше",
+    "Select objects whose exact minimum thickness is smaller than this": (
+        "Выделяет объекты, точная минимальная толщина которых меньше этого значения"
+    ),
+    "Debugger Status": "Статус отладчика",
+    (
+        "Select objects whose surface sinks below their own convex hull, "
+        "including open meshes; the deepest one becomes active"
+    ): (
+        "Выделяет объекты, поверхность которых уходит под собственную выпуклую "
+        "оболочку, а также незамкнутые меши; самый глубокий становится активным"
+    ),
+    (
+        "Select objects whose enclosed volume is below the threshold; the "
+        "smallest one becomes active"
+    ): (
+        "Выделяет объекты с объёмом меньше порога; самый маленький становится активным"
+    ),
+    (
+        "Select objects whose exact minimum thickness is below the threshold; "
+        "the thinnest one becomes active"
+    ): (
+        "Выделяет объекты с минимальной толщиной меньше порога; самый тонкий "
+        "становится активным"
+    ),
+    "Objects to check: {}": "Объектов для проверки: {}",
+    "No mesh objects to check": "Нет меш-объектов для проверки",
+    " ({} hidden, not selected)": " (скрыто и не выделено: {})",
+    "{:.4f} mm": "{:.4f} мм",
+    "{:.6f} m3": "{:.6f} м³",
+    "open mesh": "незамкнутый меш",
+    "No concave objects among {}": "Вогнутых объектов нет среди {}",
+    "Concave: {} of {}; deepest {} in {}": "Вогнутых: {} из {}; глубже всего {} в {}",
+    "No small objects among {}": "Мелких объектов нет среди {}",
+    "Small: {} of {}; smallest {} in {}": "Мелких: {} из {}; меньше всего {} в {}",
+    "No thin objects among {}": "Тонких объектов нет среди {}",
+    "Thin: {} of {}; thinnest {} in {}": "Тонких: {} из {}; тоньше всего {} в {}",
+    "SINTEZ AGR Checker": "SINTEZ AGR Checker",
+    "Tolerances: convexity {:.1f} mm, gap {:.1f} mm": "Допуски: выпуклость {:.1f} мм, зазор {:.1f} мм",
+    (
+        "Select objects SINTEZ AGR Checker would reject: open, non-manifold, "
+        "non-convex by its face-plane rule, intersecting, closer than its gap "
+        "tolerance, with UV maps, materials, non-triangle polygons or a "
+        "repeated number; numbering gaps and the polygon limit are reported"
+    ): (
+        "Выделяет объекты, которые отклонит SINTEZ AGR Checker: незамкнутые, "
+        "nonmanifold, невыпуклые по его правилу плоскостей граней, "
+        "пересекающиеся, стоящие ближе его допуска зазора, с UV-развёрткой, "
+        "материалом, нетреугольными полигонами или повторяющимся номером; "
+        "пропуски нумерации и превышение лимита полигонов сообщаются"
+    ),
+    "SINTEZ checker passes all {}": "SINTEZ пропускает все {}",
+    "SINTEZ checker rejects {} of {}; first {}{}": "SINTEZ отклонит {} из {}; первый {}{}",
+    "SINTEZ checker rejects {} of {}": "SINTEZ отклонит {} из {}",
 }
 
 _RU_OPERATORS = {
@@ -174,6 +244,10 @@ _RU_OPERATORS = {
     "Generate / Regenerate": "Создать / пересоздать",
     "Validate Colliders": "Проверить коллайдеры",
     "Remove Generated": "Удалить созданное",
+    "Select Concave Hulls": "Выделить вогнутые оболочки",
+    "Select Small Parts": "Выделить мелкие части",
+    "Select Thin Parts": "Выделить тонкие части",
+    "Select SINTEZ Checker Failures": "Выделить то, что отклонит SINTEZ",
 }
 
 TRANSLATIONS = {

@@ -14,6 +14,11 @@ import numpy as np
 
 from . import naming
 
+# Largest opening that topology-changing preprocessing may cap, and the scale
+# of its plane test. It is the strict universal AGR deviation limit, so a cap
+# can never move the surface further than the collision itself may deviate.
+CAP_TOLERANCE = 0.10
+
 
 @dataclass
 class SourceData:
@@ -233,8 +238,13 @@ def _orient_closed_shells_outward(bm):
     return oriented
 
 
-def _selective_cap_boundaries(vertices, faces, tolerance, fuse_distance):
-    """Cap obvious cut ends while preserving bounded facade openings."""
+def _selective_cap_boundaries(vertices, faces, tolerance, fuse_distance, fill_holes=True):
+    """Weld coincident vertices and, when allowed, cap obvious cut ends.
+
+    Hole filling changes the source topology. It only runs when the user has
+    explicitly enabled topology-changing preprocessing; otherwise an open
+    source stays open and is reported by the decomposition.
+    """
     bm = bmesh.new()
     try:
         bm_vertices = [bm.verts.new(tuple(point)) for point in vertices]
@@ -252,7 +262,7 @@ def _selective_cap_boundaries(vertices, faces, tolerance, fuse_distance):
         islands, face_to_island = _face_island_map(bm)
         capped = 0
 
-        for boundary in _boundary_groups(bm):
+        for boundary in (_boundary_groups(bm) if fill_holes else ()):
             boundary_vertices = {vertex for edge in boundary for vertex in edge.verts}
             points = np.asarray(
                 [tuple(vertex.co) for vertex in boundary_vertices],
@@ -499,12 +509,13 @@ def collect_objects(context, settings, objects, name=None):
     ) = _selective_cap_boundaries(
         raw_vertices,
         raw_faces,
-        settings.tolerance,
+        CAP_TOLERANCE,
         (
             settings.fuse_distance
             if settings.destructive_preprocess and settings.fuse_sources
             else 0.0001
         ),
+        fill_holes=bool(settings.destructive_preprocess),
     )
     proxy_vertices, proxy_faces = _remove_degenerate_and_duplicate_faces(
         repaired_vertices,

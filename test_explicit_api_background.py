@@ -18,6 +18,9 @@ from xivgate_agr_collision.core import decompose
 
 
 xivgate_agr_collision.register()
+
+# Strict universal AGR deviation limit that the output must stay within.
+AGR_DEVIATION_LIMIT = 0.10
 settings = bpy.context.scene.xivgate_agr_collision
 assert not settings.destructive_preprocess
 assert not settings.fuse_sources
@@ -167,9 +170,9 @@ coverage_deviation, uncovered = decompose._source_coverage_deviation(
     overlap_result["source"].vertices,
     overlap_result["source"].faces,
     overlap_pieces,
-    tolerance=bpy.context.scene.xivgate_agr_collision.tolerance,
+    tolerance=AGR_DEVIATION_LIMIT,
 )
-assert coverage_deviation <= bpy.context.scene.xivgate_agr_collision.tolerance
+assert coverage_deviation <= AGR_DEVIATION_LIMIT
 assert uncovered == 0
 generated_points = np.asarray([
     tuple(obj.matrix_world @ vertex.co)
