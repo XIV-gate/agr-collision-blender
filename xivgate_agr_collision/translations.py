@@ -223,14 +223,16 @@ _RU_DEFAULT = {
     "SINTEZ AGR Checker": "SINTEZ AGR Checker",
     "Tolerances: convexity {:.1f} mm, gap {:.1f} mm": "Допуски: выпуклость {:.1f} мм, зазор {:.1f} мм",
     (
-        "Select objects SINTEZ AGR Checker would reject: open, non-manifold or "
-        "non-convex by its face-plane rule, intersecting, or closer than its "
-        "gap tolerance; its own tolerances are used when it is installed"
+        "Select objects SINTEZ AGR Checker would reject: open, non-manifold, "
+        "non-convex by its face-plane rule, intersecting, closer than its gap "
+        "tolerance, with UV maps, materials, non-triangle polygons or a "
+        "repeated number; numbering gaps and the polygon limit are reported"
     ): (
         "Выделяет объекты, которые отклонит SINTEZ AGR Checker: незамкнутые, "
         "nonmanifold, невыпуклые по его правилу плоскостей граней, "
-        "пересекающиеся или стоящие ближе его допуска зазора; если он "
-        "установлен, берутся его собственные допуски"
+        "пересекающиеся, стоящие ближе его допуска зазора, с UV-развёрткой, "
+        "материалом, нетреугольными полигонами или повторяющимся номером; "
+        "пропуски нумерации и превышение лимита полигонов сообщаются"
     ),
     "SINTEZ checker passes all {}": "SINTEZ пропускает все {}",
     "SINTEZ checker rejects {} of {}; first {}{}": "SINTEZ отклонит {} из {}; первый {}{}",

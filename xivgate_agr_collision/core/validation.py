@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass, field
 import math
+import re
 
 import bmesh
 import numpy as np
@@ -40,7 +41,11 @@ def _bvh_from_object(ob):
 
 
 def validate_colliders(
-    colliders, expected_base=None, triangle_budget=None, checker_tolerances=None
+    colliders,
+    expected_base=None,
+    triangle_budget=None,
+    checker_tolerances=None,
+    model_polygons=None,
 ):
     errors = []
     warnings = []
@@ -145,7 +150,9 @@ def validate_colliders(
 
     if checker_tolerances is not None:
         convex_tolerance, gap_tolerance = checker_tolerances
-        checker = agr_checker_report(colliders, convex_tolerance, gap_tolerance)
+        checker = agr_checker_report(
+            colliders, convex_tolerance, gap_tolerance, model_polygons
+        )
         if not checker.passed:
             errors.append(
                 "SINTEZ AGR Checker would reject the set: {} (convexity {:.1f} mm, "
@@ -178,17 +185,32 @@ class AgrCheckerReport:
     non_convex: list[str] = field(default_factory=list)
     intersections: list[tuple[str, str]] = field(default_factory=list)
     gaps: list[tuple[str, str]] = field(default_factory=list)
+    numbering: list[str] = field(default_factory=list)
+    duplicate_numbers: list[str] = field(default_factory=list)
+    with_uv: list[str] = field(default_factory=list)
+    with_materials: list[str] = field(default_factory=list)
+    non_triangles: list[str] = field(default_factory=list)
+    polygon_count: int = 0
+    polygon_limit: int = 0
+
+    @property
+    def over_polygon_limit(self):
+        return bool(self.polygon_limit) and self.polygon_count > self.polygon_limit
 
     @property
     def passed(self):
         return not (
             self.open or self.non_manifold or self.non_convex
-            or self.intersections or self.gaps
+            or self.intersections or self.gaps or self.numbering
+            or self.with_uv or self.with_materials or self.non_triangles
+            or self.over_polygon_limit
         )
 
     @property
     def failing_names(self):
         names = set(self.open) | set(self.non_manifold) | set(self.non_convex)
+        names |= set(self.duplicate_numbers) | set(self.with_uv)
+        names |= set(self.with_materials) | set(self.non_triangles)
         for left, right in self.intersections + self.gaps:
             names.update((left, right))
         return sorted(names)
@@ -201,9 +223,16 @@ class AgrCheckerReport:
             ("non-convex", self.non_convex),
             ("intersecting pairs", self.intersections),
             ("pairs closer than the gap tolerance", self.gaps),
+            ("numbering errors", self.numbering),
+            ("with UV maps", self.with_uv),
+            ("with materials", self.with_materials),
+            ("with non-triangle polygons", self.non_triangles),
         ):
             if items:
                 parts.append("{} {}".format(len(items), label))
+        if self.over_polygon_limit:
+            parts.append("{} UCX polygons above the limit of {}".format(
+                self.polygon_count, self.polygon_limit))
         return ", ".join(parts)
 
 
@@ -287,14 +316,60 @@ def _checker_nested(vertices, planes, tolerance=0.0001):
     )
 
 
-def agr_checker_report(colliders, convex_tolerance=None, gap_tolerance=None):
+_NUMBER_PATTERN = re.compile(r"_(\d{3})$")
+
+
+def agr_checker_polygon_limit(model_polygons):
+    """UCX polygon limit SINTEZ AGR Checker derives from the model's polygons.
+
+    15 000 below 50 000 model polygons, otherwise 5 % of them, compared
+    strictly - so the largest allowed count is the floor of that 5 %.
+    """
+    if model_polygons < 50_000:
+        return 15_000
+    return int(math.floor(model_polygons * 0.05))
+
+
+def _numbering_errors(colliders, report):
+    """Numbers after the last underscore must run 1..N without gaps or repeats.
+
+    Names without a trailing three-digit number are not part of the series,
+    as in the checker, where their format is a naming-mask matter.
+    """
+    numbers = {}
+    for name in sorted({ob.name for ob in colliders}):
+        match = _NUMBER_PATTERN.search(name)
+        if match:
+            numbers.setdefault(int(match.group(1)), []).append(name)
+    if not numbers:
+        return
+    for number, names in sorted(numbers.items()):
+        if len(names) > 1:
+            report.numbering.append(
+                "number {:03d} repeats ({})".format(number, ", ".join(names)))
+            report.duplicate_numbers.extend(names)
+    ordered = sorted(numbers)
+    if ordered[0] != 1:
+        report.numbering.append(
+            "numbering starts at {:03d}, not 001".format(ordered[0]))
+    for number in range(ordered[0], ordered[-1]):
+        if number not in numbers:
+            report.numbering.append("number {:03d} is missing".format(number))
+
+
+def agr_checker_report(
+    colliders, convex_tolerance=None, gap_tolerance=None, model_polygons=None
+):
     """Judge a UCX set by the rules SINTEZ AGR Checker applies to it.
 
     Closure by Euler characteristic, non-manifold edges, the face-plane
     convexity rule, and for every pair with touching bounds: triangle
     overlap, one hull nested in another, and any vertex closer than the gap
-    tolerance to the other hull. Reimplemented from the checker's documented
-    behaviour so a generated set can be refused before the checker sees it.
+    tolerance to the other hull. Also the checker's rules for collision
+    objects beyond geometry: continuous 001..N numbering, no UV maps, no
+    materials, triangles only, and - when ``model_polygons`` is known - the
+    UCX polygon limit. Reimplemented from the checker's behaviour so a
+    generated set can be refused before the checker sees it.
     """
     if convex_tolerance is None:
         convex_tolerance = AGR_CHECKER_CONVEX_TOLERANCE
@@ -302,8 +377,16 @@ def agr_checker_report(colliders, convex_tolerance=None, gap_tolerance=None):
         gap_tolerance = AGR_CHECKER_GAP_TOLERANCE
     report = AgrCheckerReport()
     colliders = sorted(colliders, key=lambda item: item.name)
+    _numbering_errors(colliders, report)
     for ob in colliders:
         mesh = ob.data
+        report.polygon_count += len(mesh.polygons)
+        if len(mesh.uv_layers):
+            report.with_uv.append(ob.name)
+        if len(mesh.materials):
+            report.with_materials.append(ob.name)
+        if any(len(polygon.vertices) != 3 for polygon in mesh.polygons):
+            report.non_triangles.append(ob.name)
         if len(mesh.vertices) - len(mesh.edges) + len(mesh.polygons) != 2:
             report.open.append(ob.name)
             continue
@@ -350,10 +433,18 @@ def agr_checker_report(colliders, convex_tolerance=None, gap_tolerance=None):
                 for vertex in second["vertices"]
             ):
                 report.gaps.append(pair)
+    if model_polygons:
+        report.polygon_limit = agr_checker_polygon_limit(model_polygons)
     return report
 
 
 def agr_triangle_budget(source_triangles):
+    """UCX triangle budget: 15 000 below 50 000 source triangles, else 5 %.
+
+    The requirements round 5 % up and cap it at 100 000; SINTEZ AGR Checker
+    compares against the exact 5 %, so a count one above it fails there. The
+    floor passes both.
+    """
     if source_triangles < 50_000:
         return 15_000
-    return min(100_000, int(math.ceil(source_triangles * 0.05)))
+    return min(100_000, int(math.floor(source_triangles * 0.05)))

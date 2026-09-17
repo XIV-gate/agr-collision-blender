@@ -38,10 +38,12 @@ def mesh_object(name, build, collection, location=FAR):
     return ob
 
 
-def cube(size=(1.0, 1.0, 1.0)):
+def cube(size=(1.0, 1.0, 1.0), triangulate=False):
     def build(bm):
         bmesh.ops.create_cube(bm, size=1.0)
         bmesh.ops.scale(bm, vec=size, verts=bm.verts)
+        if triangulate:
+            bmesh.ops.triangulate(bm, faces=bm.faces[:])
     return build
 
 
@@ -136,15 +138,37 @@ for icon in ("OUTLINER_COLLECTION", "MOD_SMOOTH", "SNAP_VOLUME", "MOD_SOLIDIFY",
 
 pair = bpy.data.collections.new("DBG_PAIR")
 scene.collection.children.link(pair)
-mesh_object("UCX_Pair_001", cube(), pair, (0.0, 0.0, 0.0))
-mesh_object("UCX_Pair_002", cube(), pair, (0.5, 0.0, 0.0))
-mesh_object("UCX_Pair_003", cube(), pair, (5.0, 0.0, 0.0))
+mesh_object("UCX_Pair_001", cube(triangulate=True), pair, (0.0, 0.0, 0.0))
+mesh_object("UCX_Pair_002", cube(triangulate=True), pair, (0.5, 0.0, 0.0))
+mesh_object("UCX_Pair_003", cube(triangulate=True), pair, (5.0, 0.0, 0.0))
 bpy.context.view_layer.update()
 settings.debug_collection = pair
 assert bpy.ops.xivgate_agr_collision.debug_agr_checker() == {"FINISHED"}
 assert selected_names() == {"UCX_Pair_001", "UCX_Pair_002"}, selected_names()
 checker_status = settings.debug_status
 assert "intersecting" in checker_status, checker_status
+
+meta = bpy.data.collections.new("DBG_META")
+scene.collection.children.link(meta)
+with_material = mesh_object("UCX_Meta_001", cube(triangulate=True), meta, (0.0, 20.0, 0.0))
+with_material.data.materials.append(bpy.data.materials.new("Dbg_Material"))
+with_uv = mesh_object("UCX_Meta_002", cube(triangulate=True), meta, (5.0, 20.0, 0.0))
+with_uv.data.uv_layers.new(name="UVMap")
+mesh_object("UCX_Meta_004", cube(triangulate=True), meta, (10.0, 20.0, 0.0))
+mesh_object("UCX_Meta_005", cube(), meta, (15.0, 20.0, 0.0))
+bpy.context.view_layer.update()
+settings.debug_collection = meta
+assert bpy.ops.xivgate_agr_collision.debug_agr_checker() == {"FINISHED"}
+assert selected_names() == {"UCX_Meta_001", "UCX_Meta_002", "UCX_Meta_005"}, selected_names()
+meta_status = settings.debug_status
+for fragment in ("numbering errors", "with UV maps", "with materials", "non-triangle"):
+    assert fragment in meta_status, meta_status
+
+from xivgate_agr_collision.core import validation
+limited = validation.agr_checker_report(list(meta.objects), model_polygons=10)
+assert limited.polygon_limit == 15000 and not limited.over_polygon_limit
+assert validation.agr_checker_polygon_limit(60001) == 3000
+assert validation.agr_triangle_budget(50001) == 2500
 
 bpy.ops.mesh.primitive_cube_add(size=2.0, location=(10.0, 20.0, 3.0))
 source = bpy.context.object

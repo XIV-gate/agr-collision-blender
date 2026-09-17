@@ -429,6 +429,7 @@ def generate_for_objects(
             expected_base=source_data.name,
             triangle_budget=budget,
             checker_tolerances=validation.agr_checker_tolerances(context.scene),
+            model_polygons=source_data.raw_triangles,
         )
         if not report.valid:
             raise RuntimeError(report.errors[0])
@@ -668,6 +669,7 @@ class AGR_OT_validate(bpy.types.Operator):
             expected_base=base,
             triangle_budget=budget,
             checker_tolerances=validation.agr_checker_tolerances(context.scene),
+            model_polygons=source_triangles or None,
         )
         settings.last_colliders = report.collider_count
         settings.last_triangles = report.triangle_count
@@ -882,16 +884,22 @@ class AGR_OT_debug_agr_checker(_DebugOperator, bpy.types.Operator):
     bl_idname = "xivgate_agr_collision.debug_agr_checker"
     bl_label = "Select SINTEZ Checker Failures"
     bl_description = (
-        "Select objects SINTEZ AGR Checker would reject: open, non-manifold or "
-        "non-convex by its face-plane rule, intersecting, or closer than its "
-        "gap tolerance; its own tolerances are used when it is installed"
+        "Select objects SINTEZ AGR Checker would reject: open, non-manifold, "
+        "non-convex by its face-plane rule, intersecting, closer than its gap "
+        "tolerance, with UV maps, materials, non-triangle polygons or a "
+        "repeated number; numbering gaps and the polygon limit are reported"
     )
 
     def execute(self, context):
         settings = context.scene.xivgate_agr_collision
         targets = debug_targets(settings)
         convex_tolerance, gap_tolerance = validation.agr_checker_tolerances(context.scene)
-        report = validation.agr_checker_report(targets, convex_tolerance, gap_tolerance)
+        report = validation.agr_checker_report(
+            targets,
+            convex_tolerance,
+            gap_tolerance,
+            model_polygons=settings.last_input_triangles or None,
+        )
         by_name = {ob.name: ob for ob in targets}
         found = [(by_name[name], 0.0) for name in report.failing_names]
         status = self.finish(context, found, len(targets), {
